@@ -6,7 +6,6 @@ $IMAGE_SAVE_PATH = $env:IMAGE_SAVE_PATH
 $ORIGINAL_IMAGE_PATH = $env:ORIGINAL_IMAGE_PATH
 $TEMP_IMAGE_PATH = $env:TEMP_IMAGE_PATH
 $FONT_PATH = $env:FONT_PATH
-$FONT_NAME = $env:FONT_NAME  # Name of the font file without .ttf extension
 $FONT_COLOR = $env:FONT_COLOR
 $BACK_COLOR = $env:BACK_COLOR
 $FONT_SIZE = [int]$env:FONT_SIZE
@@ -16,33 +15,14 @@ $HORIZONTAL_OFFSET = [int]$env:HORIZONTAL_OFFSET
 $HORIZONTAL_ALIGN = $env:HORIZONTAL_ALIGN
 $VERTICAL_OFFSET = [int]$env:VERTICAL_OFFSET
 $VERTICAL_ALIGN = $env:VERTICAL_ALIGN
-$BACK_WIDTH = [int]$env:BACK_WIDTH
-$BACK_HEIGHT = [int]$env:BACK_HEIGHT
-$DATE_FORMAT = $env:DATE_FORMAT
-$OVERLAY_TEXT = $env:OVERLAY_TEXT
 $RUN_INTERVAL = [int]$env:RUN_INTERVAL
-$ENABLE_DAY_SUFFIX = [bool]($env:ENABLE_DAY_SUFFIX -eq "true")
-$ENABLE_UPPERCASE = [bool]($env:ENABLE_UPPERCASE -eq "true")
-$LANGUAGE = $env:LANGUAGE  # For month abbreviation. You can change this as needed (e.g., "fr-FR" for French)
+$OVERLAY_TEXT = $env:OVERLAY_TEXT
 
-# Set defaults if not provided
-if (-not $DATE_FORMAT) {
-    $DATE_FORMAT = "MMM d"
-}
-if (-not $LANGUAGE) {
-    $LANGUAGE = "en-US"
-}
-if (-not $OVERLAY_TEXT) {
-    $OVERLAY_TEXT = "Leaving"
-}
 if (-not $RUN_INTERVAL) {
     $RUN_INTERVAL = 8 * 60 * 60 # Default to 8 hours in seconds
 } else {
     $RUN_INTERVAL = $RUN_INTERVAL * 60 # Convert minutes to seconds
 }
-
-# Define culture based on selected language
-$cultureInfo = New-Object System.Globalization.CultureInfo($LANGUAGE)
 
 # Define path for tracking collection state
 $CollectionStateFile = "$IMAGE_SAVE_PATH/current_collection_state.json"
@@ -97,9 +77,13 @@ function Save-CollectionState {
     }
 }
 
-
 # Function to get data from Maintainerr
 function Get-MaintainerrData {
+    if ($MAINTAINERR_URL -notmatch "/api/collections$") {
+        $MAINTAINERR_URL = "$MAINTAINERR_URL/api/collections"
+    }
+
+    Write-Host "Fetching data from: $MAINTAINERR_URL"
     $response = Invoke-RestMethod -Uri $MAINTAINERR_URL -Method Get
     return $response
 }
@@ -114,65 +98,80 @@ function Calculate-Date {
         [int]$deleteAfterDays
     )
 
-    Write-Host "Attempting to parse date: $addDate"
     $deleteDate = $addDate.AddDays($deleteAfterDays)
-    
-    # Format the date using the specified culture
-    $formattedDate = $deleteDate.ToString($DATE_FORMAT, $cultureInfo)
-
-    if ($ENABLE_DAY_SUFFIX) {
-        $daySuffix = switch ($deleteDate.Day) {
-            1  { "st" }
-            2  { "nd" }
-            3  { "rd" }
-            21 { "st" }
-            22 { "nd" }
-            23 { "rd" }
-            31 { "st" }
-            default { "th" }
-        }
-        $formattedDate = $formattedDate + $daySuffix
+    $daySuffix = switch ($deleteDate.Day) {
+        1  { "st" }
+        2  { "nd" }
+        3  { "rd" }
+        21 { "st" }
+        22 { "nd" }
+        23 { "rd" }
+        31 { "st" }
+        default { "th" }
     }
-    
-    if ($ENABLE_UPPERCASE) {
-        $formattedDate = $formattedDate.ToUpper()
-    }
-    
+    $formattedDate = $deleteDate.ToString("MMM d") + $daySuffix
     return $formattedDate
 }
 
-# Function to download the current poster
 function Download-Poster {
     param (
         [string]$posterUrl,
-        [string]$savePath
+        [string]$savePathBase
     )
+
     try {
-        # Check if the file exists and meets minimum size requirements
-        if (-not (Test-Path -Path $savePath) -or (Get-Item -Path $savePath).Length -lt 1024) {
-            Write-Host "Downloading poster from: $posterUrl to: $savePath"
+        Write-Host "Downloading poster from: $posterUrl"
 
-            # Attempt to download the poster
-            Invoke-WebRequest -Uri $posterUrl -OutFile $savePath -Headers @{"X-Plex-Token"=$PLEX_TOKEN}
+        $tempFile = "${savePathBase}.jpg"
+        Invoke-WebRequest -Uri $posterUrl -Headers @{"X-Plex-Token"=$PLEX_TOKEN} -OutFile $tempFile -UseBasicParsing
 
-            # Validate the downloaded file
-            if (-not (Test-Path -Path $savePath) -or (Get-Item -Path $savePath).Length -lt 1024) {
-                throw "Poster download failed or file is too small."
-            }
-
-            # Optionally, validate the file as an image
-            if (-not (Validate-Poster -filePath $savePath)) {
-                Write-Warning "Downloaded file at $savePath is not a valid image. Deleting file."
-                Remove-Item -Path $savePath -Force
-                throw "Invalid poster file format detected."
-            }
-
-            Write-Host "Successfully downloaded poster to: $savePath"
-        } else {
-            Write-Host "Poster already exists and meets size requirements at: $savePath"
+        # Check if file size is too small (likely invalid)
+        if ((Get-Item $tempFile).Length -lt 1024) {
+            Write-Warning "Downloaded file at $tempFile is too small (<1 KB). Treating as invalid."
+            Remove-Item -Path $tempFile -Force
+            throw "Downloaded file too small to be valid image."
         }
+
+        # Identify real file type
+        $formatInfo = & magick "$tempFile" -format "%m" info:
+        Write-Host "Actual format detected: $formatInfo"
+
+        if ([string]::IsNullOrEmpty($formatInfo)) {
+            Remove-Item -Path $tempFile -Force
+            throw "Unable to detect format."
+        }
+
+        $ext = switch ($formatInfo.ToLower()) {
+            "jpeg" { ".jpg" }
+            "jpg" { ".jpg" }
+            "png" { ".png" }
+            "webp" { ".webp" }
+            default { ".jpg" } # Fallback
+        }
+
+        # Correct final path
+        $savePath = "${savePathBase}${ext}"
+
+        if ($ext -ne ".jpg") {
+            Move-Item -Path $tempFile -Destination $savePath -Force
+        } else {
+            $savePath = $tempFile
+        }
+
+        # Final validate
+        if (-not (Validate-Poster -filePath $savePath)) {
+            Write-Warning "Downloaded file at $savePath is not a valid image. Deleting file."
+            Remove-Item -Path $savePath -Force
+            throw "Invalid poster file format detected."
+        }
+
+        Write-Host "Successfully downloaded and saved poster to: $savePath"
+        return $savePath
     } catch {
-        Write-Warning "Failed to download poster from $posterUrl to $savePath. Error: $_"
+        Write-Warning "Failed to download poster from $posterUrl. Error: $_"
+        if (Test-Path $tempFile) {
+            Remove-Item -Path $tempFile -Force
+        }
         throw
     }
 }
@@ -195,7 +194,6 @@ function Revert-ToOriginalPoster {
     Invoke-RestMethod -Uri $uploadUrl -Method Post -Body $posterBytes -ContentType "image/jpeg"
 }
 
-# Function to add overlay text to the poster
 function Add-Overlay {
     param (
         [string]$imagePath,
@@ -209,94 +207,93 @@ function Add-Overlay {
         [int]$horizontalOffset = $HORIZONTAL_OFFSET,
         [string]$horizontalAlign = $HORIZONTAL_ALIGN,
         [int]$verticalOffset = $VERTICAL_OFFSET,
-        [string]$verticalAlign = $VERTICAL_ALIGN,
-        [int]$backWidth = $BACK_WIDTH,
-        [int]$backHeight = $BACK_HEIGHT
+        [string]$verticalAlign = $VERTICAL_ALIGN
     )
 
-    Add-Type -AssemblyName System.Drawing
+    $fileName = [System.IO.Path]::GetFileName($imagePath)
+    $outputImagePath = Join-Path -Path $TEMP_IMAGE_PATH -ChildPath $fileName
 
-    $image = [System.Drawing.Image]::FromFile($imagePath)
-    $graphics = [System.Drawing.Graphics]::FromImage($image)
+    # Get poster dimensions
+    $dimensions = & magick "$imagePath" -format "%w %h" info:
+    $width, $height = $dimensions -split " "
 
-    # Get image dimensions
-    $imageWidth = $image.Width
-    $imageHeight = $image.Height
+    # Scaling
+    $scaleFactor = $width / 1000
+    $scaledFontSize = [math]::Min([math]::Round($fontSize * $scaleFactor), 100)
+    $scaledPadding = [math]::Round($padding * $scaleFactor)
+    $scaledHorizontalOffset = [math]::Round($horizontalOffset * $scaleFactor)
+    $scaledVerticalOffset = [math]::Round($verticalOffset * $scaleFactor)
+    $scaledBackRadius = [math]::Round($backRadius * $scaleFactor)
 
-    # Calculate scaling factors based on the image dimensions
-    $scaleFactor = $imageWidth / 1000  # Use a reference width of 1000px
-    $scaledFontSize = [int]($fontSize * $scaleFactor)
-    $scaledPadding = [int]($padding * $scaleFactor)
-    $scaledBackRadius = [int]($backRadius * $scaleFactor)
-    $scaledHorizontalOffset = [int]($horizontalOffset * $scaleFactor)
-    $scaledVerticalOffset = [int]($verticalOffset * $scaleFactor)
-    # Load the custom font
-    $privateFontCollection = New-Object System.Drawing.Text.PrivateFontCollection
-    if ($FONT_NAME) {
-        $selectedFontPath = Join-Path $FONT_PATH "$FONT_NAME.ttf"
-        if (Test-Path $selectedFontPath) {
-            $privateFontCollection.AddFontFile($selectedFontPath)
-        } else {
-            Write-Warning "Font $FONT_NAME not found, using default font"
-            $privateFontCollection.AddFontFile($fontPath)
-        }
+    # Gravity alignment
+    $gravityX = switch ($horizontalAlign.ToLower()) {
+        "left"    { "West" }
+        "center"  { "Center" }
+        "right"   { "East" }
+        default   { "Center" }
+    }
+    $gravityY = switch ($verticalAlign.ToLower()) {
+        "top"     { "North" }
+        "center"  { "Center" }
+        "bottom"  { "South" }
+        default   { "South" }
+    }
+
+    $gravity = if ($gravityY -eq "Center") {
+        $gravityX
+    } elseif ($gravityX -eq "Center") {
+        $gravityY
     } else {
-        $privateFontCollection.AddFontFile($fontPath)
-    }
-    $fontFamily = $privateFontCollection.Families[0]
-    $font = New-Object System.Drawing.Font($fontFamily, $scaledFontSize, [System.Drawing.FontStyle]::Bold)
-
-    $brush = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml($fontColor))
-    $backBrush = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml($backColor))
-
-    # Measure the text size
-    $size = $graphics.MeasureString($text, $font)
-
-    # Use custom dimensions if provided, otherwise calculate based on text size
-    $scaledBackWidth = if ($backWidth) { [int]($backWidth * $scaleFactor) } else { [int]($size.Width + $scaledPadding * 2) }
-    $scaledBackHeight = if ($backHeight) { [int]($backHeight * $scaleFactor) } else { [int]($size.Height + $scaledPadding * 2) }
-
-    # Update the subsequent calculations to use the new variables
-    switch ($horizontalAlign) {
-        "right" { $x = $image.Width - $scaledBackWidth - $scaledHorizontalOffset }
-        "center" { $x = ($image.Width - $scaledBackWidth) / 2 }
-        "left" { $x = $scaledHorizontalOffset }
-        default { $x = $image.Width - $scaledBackWidth - $scaledHorizontalOffset }
+        "$gravityY$gravityX"
     }
 
-    switch ($verticalAlign) {
-        "bottom" { $y = $image.Height - $scaledBackHeight - $scaledVerticalOffset }
-        "center" { $y = ($image.Height - $scaledBackHeight) / 2 }
-        "top" { $y = $scaledVerticalOffset }
-        default { $y = $image.Height - $scaledBackHeight - $scaledVerticalOffset }
+    $labelPath = Join-Path -Path $TEMP_IMAGE_PATH -ChildPath "label.png"
+
+    # Create label
+    & magick -background "$backColor" `
+             -fill "$fontColor" `
+             -font "$fontPath" `
+             -pointsize $scaledFontSize `
+             label:"$text" `
+             "$labelPath"
+
+    # Add padding
+    & magick "$labelPath" `
+             -bordercolor "$backColor" `
+             -border $scaledPadding `
+             "$labelPath"
+
+    # Rounded corners
+    if ($scaledBackRadius -gt 0) {
+        $labelDimensions = & magick "$labelPath" -format "%w %h" info:
+        $labelWidth, $labelHeight = $labelDimensions -split " "
+        $drawExpr = "roundrectangle 0,0 $($labelWidth - 1),$($labelHeight - 1) $scaledBackRadius,$scaledBackRadius"
+
+        & magick "$labelPath" `
+            "(" "+clone" "-alpha" "extract" "-draw" "$drawExpr" ")" `
+            "-compose" "CopyOpacity" "-composite" `
+            "$labelPath"
     }
 
-    # Draw the rounded rectangle background
-    $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $path.AddArc($x, $y, $scaledBackRadius, $scaledBackRadius, 180, 90)
-    $path.AddArc($x + $scaledBackWidth - $scaledBackRadius, $y, $scaledBackRadius, $scaledBackRadius, 270, 90)
-    $path.AddArc($x + $scaledBackWidth - $scaledBackRadius, $y + $scaledBackHeight - $scaledBackRadius, $scaledBackRadius, $scaledBackRadius, 0, 90)
-    $path.AddArc($x, $y + $scaledBackHeight - $scaledBackRadius, $scaledBackRadius, $scaledBackRadius, 90, 90)
-    $path.CloseFigure()
-    $graphics.FillPath($backBrush, $path)
+    # Add shadow
+    $shadowedLabelPath = Join-Path -Path $TEMP_IMAGE_PATH -ChildPath "shadowed_label.png"
+    & magick "$labelPath" `
+             "(" "+clone" "-background" "black" "-shadow" "60x3+3+3" ")" `
+             "+swap" "-background" "none" "-layers" "merge" "+repage" `
+             "$shadowedLabelPath"
 
-    # Adjust the text position to account for ascent and descent
-    $textX = $x + ($scaledBackWidth - $size.Width) / 2
-    $textY = $y + ($scaledBackHeight - $size.Height) / 2
+    # Composite onto poster
+    & magick "$imagePath" `
+             "$shadowedLabelPath" `
+             -gravity $gravity `
+             -geometry +$scaledHorizontalOffset+$scaledVerticalOffset `
+             -compose over -composite `
+             "$outputImagePath"
 
-    $graphics.DrawString($text, $font, $brush, $textX, $textY)
+    # Cleanup
+    Remove-Item -Path $labelPath -ErrorAction SilentlyContinue
+    Remove-Item -Path $shadowedLabelPath -ErrorAction SilentlyContinue
 
-    $outputImagePath = [System.IO.Path]::Combine($TEMP_IMAGE_PATH, [System.IO.Path]::GetFileName($imagePath))
-
-    try {
-        $image.Save($outputImagePath)
-    } catch {
-        Write-Error "Failed to save image: $_"
-    } finally {
-        $graphics.Dispose()
-        $image.Dispose()
-    }
     return $outputImagePath
 }
 
@@ -306,11 +303,21 @@ function Upload-Poster {
         [string]$posterPath,
         [string]$metadataId
     )
-    $uploadUrl = "$PLEX_URL/library/metadata/$metadataId/posters?X-Plex-Token=$PLEX_TOKEN"
-    $posterBytes = [System.IO.File]::ReadAllBytes($posterPath)
-    Invoke-RestMethod -Uri $uploadUrl -Method Post -Body $posterBytes -ContentType "image/jpeg"
 
-    # Delete the temp image after upload
+    $uploadUrl = "$PLEX_URL/library/metadata/$metadataId/posters?X-Plex-Token=$PLEX_TOKEN"
+    $extension = [System.IO.Path]::GetExtension($posterPath).ToLower()
+
+    switch ($extension) {
+        ".jpg" { $contentType = "image/jpeg" }
+        ".jpeg" { $contentType = "image/jpeg" }
+        ".png" { $contentType = "image/png" }
+        ".webp" { $contentType = "image/webp" }
+        default { $contentType = "application/octet-stream" }
+    }
+
+    $posterBytes = [System.IO.File]::ReadAllBytes($posterPath)
+    Invoke-RestMethod -Uri $uploadUrl -Method Post -Body $posterBytes -ContentType $contentType
+
     try {
         Remove-Item -Path $posterPath -ErrorAction Stop
         Write-Host "Deleted temporary file: $posterPath"
@@ -319,21 +326,25 @@ function Upload-Poster {
     }
 }
 
-# Main function to process the media items
+
 function Validate-Poster {
     param (
         [string]$filePath
     )
     try {
-        Add-Type -AssemblyName System.Drawing
-        $image = [System.Drawing.Image]::FromFile($filePath)
-        $image.Dispose()
-        return $true
+        $result = & magick "$filePath" -format "%m" info:
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        } else {
+            Write-Warning "File at $filePath is not a valid image (identify failed)."
+            return $false
+        }
     } catch {
         Write-Warning "File at $filePath is not a valid image. Error: $_"
         return $false
     }
 }
+
 
 
 # Function to perform janitorial tasks: revert and delete unused posters
@@ -348,23 +359,26 @@ function Janitor-Posters {
 
     Write-Host "Running janitorial logic for collection: $collectionName"
 
-    # Gather all downloaded posters
-    $downloadedPosters = Get-ChildItem -Path $originalImagePath -Filter "*.jpg" | ForEach-Object { $_.BaseName }
+    # Gather all downloaded posters (any image extension)
+    $downloadedPosters = Get-ChildItem -Path $originalImagePath -Include *.jpg, *.jpeg, *.png, *.webp -Recurse |
+        ForEach-Object { @{ BaseName = $_.BaseName; FullName = $_.FullName } }
+
+    $downloadedGUIDs = $downloadedPosters | Select-Object -ExpandProperty BaseName
 
     # GUIDs considered valid (in Plex, in Maintainerr, or in newState)
     $validGUIDs = $mediaList + $maintainerrGUIDs + $newState.Keys
 
     # GUIDs to handle
-    $unusedGUIDs = $downloadedPosters | Where-Object { $_ -notin $validGUIDs }
-    $revertGUIDs = $downloadedPosters | Where-Object { $_ -in $mediaList -and $_ -notin $maintainerrGUIDs }
+    $unusedGUIDs = $downloadedGUIDs | Where-Object { $_ -notin $validGUIDs }
+    $revertGUIDs = $downloadedGUIDs | Where-Object { $_ -in $mediaList -and $_ -notin $maintainerrGUIDs }
 
     # Revert posters for media still in Plex but no longer in Maintainerr
     foreach ($guid in $revertGUIDs) {
-        $posterPath = Join-Path -Path $originalImagePath -ChildPath "$guid.jpg"
-        if (Test-Path -Path $posterPath) {
+        $poster = $downloadedPosters | Where-Object { $_.BaseName -eq $guid }
+        if ($poster) {
             Write-Host "Reverting poster for GUID: $guid"
-            Revert-ToOriginalPoster -plexId $guid -originalImagePath $posterPath
-            Remove-Item -Path $posterPath -ErrorAction SilentlyContinue
+            Revert-ToOriginalPoster -plexId $guid -originalImagePath $poster.FullName
+            Remove-Item -Path $poster.FullName -ErrorAction SilentlyContinue
         } else {
             Write-Warning "No poster file found to revert for GUID: $guid"
         }
@@ -372,10 +386,10 @@ function Janitor-Posters {
 
     # Delete posters for media removed from Plex or no longer valid
     foreach ($guid in $unusedGUIDs) {
-        $posterPath = Join-Path -Path $originalImagePath -ChildPath "$guid.jpg"
-        if (Test-Path -Path $posterPath) {
+        $poster = $downloadedPosters | Where-Object { $_.BaseName -eq $guid }
+        if ($poster) {
             Write-Host "Deleting unused poster for GUID: $guid"
-            Remove-Item -Path $posterPath -ErrorAction SilentlyContinue
+            Remove-Item -Path $poster.FullName -ErrorAction SilentlyContinue
         }
     }
 }
@@ -393,8 +407,18 @@ function Process-MediaItems {
 
         foreach ($item in $collection.media) {
             $plexId = $item.plexId.ToString()
-            $originalImagePath = "$ORIGINAL_IMAGE_PATH/$plexId.jpg"
-            $tempImagePath = "$TEMP_IMAGE_PATH/$plexId.jpg"
+
+            # Find the original poster file, whatever the extension
+            $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse
+            $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { $null }
+
+            # If no poster found yet, define default jpg
+            if (-not $originalImagePath) {
+                $originalImagePath = "$ORIGINAL_IMAGE_PATH/$plexId.jpg"
+            }
+
+            $ext = [System.IO.Path]::GetExtension($originalImagePath)
+            $tempImagePath = "$TEMP_IMAGE_PATH/$plexId$ext"
             $posterUrl = "$PLEX_URL/library/metadata/$plexId/thumb?X-Plex-Token=$PLEX_TOKEN"
 
             # Add media item to new state
@@ -405,9 +429,8 @@ function Process-MediaItems {
                 # Ensure the original poster is downloaded first
                 if (-not (Test-Path -Path $originalImagePath)) {
                     Write-Host "Original poster not found for Plex ID: $plexId. Downloading..."
-                    Download-Poster -posterUrl $posterUrl -savePath $originalImagePath
+                    $originalImagePath = Download-Poster -posterUrl $posterUrl -savePathBase ("$ORIGINAL_IMAGE_PATH/$plexId")
 
-                    # Verify if the poster was successfully downloaded
                     if (-not (Test-Path -Path $originalImagePath)) {
                         throw "Failed to download original poster for Plex ID: $plexId"
                     }
@@ -421,7 +444,7 @@ function Process-MediaItems {
 
                 # Apply overlay and upload the modified poster
                 Copy-Item -Path $originalImagePath -Destination $tempImagePath -Force
-                $tempImagePath = Add-Overlay -imagePath $tempImagePath -text "$OVERLAY_TEXT $formattedDate" -fontColor $FONT_COLOR -backColor $BACK_COLOR -fontPath $FONT_PATH -fontSize $FONT_SIZE -padding $PADDING -backRadius $BACK_RADIUS -horizontalOffset $HORIZONTAL_OFFSET -horizontalAlign $HORIZONTAL_ALIGN -verticalOffset $VERTICAL_OFFSET -verticalAlign $VERTICAL_ALIGN
+                $tempImagePath = Add-Overlay -imagePath $tempImagePath -text "$OVERLAY_TEXT $formattedDate"
                 Upload-Poster -posterPath $tempImagePath -metadataId $plexId
             } catch {
                 Write-Warning "Failed to process Plex ID: $plexId. Error: $_"
@@ -433,17 +456,19 @@ function Process-MediaItems {
     foreach ($plexId in $currentState.Keys) {
         if (-not $newState.ContainsKey($plexId)) {
             Write-Host "Item $plexId detected as removed (not in newState)."
-            $originalImagePath = "$ORIGINAL_IMAGE_PATH/$plexId.jpg"
 
-            # Revert to the original poster if it exists
-            if (Test-Path -Path $originalImagePath) {
+            # Find the original image
+            $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse
+            $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { $null }
+
+            if ($originalImagePath -and (Test-Path -Path $originalImagePath)) {
                 Write-Host "Reverting Plex ID: $plexId to original poster."
                 Revert-ToOriginalPoster -plexId $plexId -originalImagePath $originalImagePath
             } else {
                 Write-Warning "Original poster not found for Plex ID: $plexId. Skipping revert."
             }
 
-            # Mark as removed in the state
+            # Mark as removed
             $newState[$plexId] = $false
         } else {
             Write-Host "Item $plexId is still in the collection."
@@ -451,10 +476,9 @@ function Process-MediaItems {
     }
 
     # Run janitorial logic
-	$plexGUIDs = $currentState.Keys
-	$maintainerrGUIDs = $newState.Keys
-	Janitor-Posters -mediaList $plexGUIDs -maintainerrGUIDs $maintainerrGUIDs -newState $newState -originalImagePath $ORIGINAL_IMAGE_PATH -collectionName "All Media"
-
+    $plexGUIDs = $currentState.Keys
+    $maintainerrGUIDs = $newState.Keys
+    Janitor-Posters -mediaList $plexGUIDs -maintainerrGUIDs $maintainerrGUIDs -newState $newState -originalImagePath $ORIGINAL_IMAGE_PATH -collectionName "All Media"
 
     # Save the new state
     $tempState = @{}
@@ -464,6 +488,7 @@ function Process-MediaItems {
     Write-Host "Saving State: $(ConvertTo-Json $tempState -Depth 10)"
     Save-CollectionState -state $newState
 }
+
 
 # Ensure the images directories exist
 if (-not (Test-Path -Path $IMAGE_SAVE_PATH)) {
