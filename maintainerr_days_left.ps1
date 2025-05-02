@@ -17,12 +17,29 @@ $VERTICAL_OFFSET = [int]$env:VERTICAL_OFFSET
 $VERTICAL_ALIGN = $env:VERTICAL_ALIGN
 $RUN_INTERVAL = [int]$env:RUN_INTERVAL
 $OVERLAY_TEXT = $env:OVERLAY_TEXT
+$ENABLE_DAY_SUFFIX = [bool]($env:ENABLE_DAY_SUFFIX -eq "true")
+$ENABLE_UPPERCASE = [bool]($env:ENABLE_UPPERCASE -eq "true")
+$LANGUAGE = $env:LANGUAGE 
+$DATE_FORMAT = $env:DATE_FORMAT
 
+# Set defaults if not provided
+if (-not $DATE_FORMAT) {
+    $DATE_FORMAT = "MMM d"
+}
+if (-not $LANGUAGE) {
+    $LANGUAGE = "en-US"
+}
+if (-not $OVERLAY_TEXT) {
+    $OVERLAY_TEXT = "Leaving"
+}
 if (-not $RUN_INTERVAL) {
     $RUN_INTERVAL = 8 * 60 * 60 # Default to 8 hours in seconds
 } else {
     $RUN_INTERVAL = $RUN_INTERVAL * 60 # Convert minutes to seconds
 }
+
+# Define culture based on selected language
+$cultureInfo = New-Object System.Globalization.CultureInfo($LANGUAGE)
 
 # Define path for tracking collection state
 $CollectionStateFile = "$IMAGE_SAVE_PATH/current_collection_state.json"
@@ -30,6 +47,35 @@ $CollectionStateFile = "$IMAGE_SAVE_PATH/current_collection_state.json"
 # Initialize collection state if the file does not exist
 if (-not (Test-Path -Path $CollectionStateFile)) {
     @{} | ConvertTo-Json | Set-Content -Path $CollectionStateFile
+}
+
+function Log-Message {
+    param (
+        [string]$Type,
+        [string]$Message
+    )
+
+    # ANSI escape codes for colors
+    $ColorReset = "`e[0m"
+    $ColorBlue = "`e[34m"
+    $ColorRed = "`e[31m"
+    $ColorYellow = "`e[33m"
+    $ColorGray = "`e[90m"
+    $ColorGreen = "`e[32m"
+    $ColorDefault = "`e[37m"
+
+    # Select color based on message type
+    $color = switch ($Type) {
+        "INF" { $ColorBlue }
+        "ERR" { $ColorRed }
+        "WRN" { $ColorYellow }
+        "DBG" { $ColorGray }
+        "SUC" { $ColorGreen }
+        default { $ColorDefault }
+    }
+
+    # Output the colored type and uncolored message
+    Write-Host "$($color)[$Type]$($ColorReset) $Message"
 }
 
 function Load-CollectionState {
@@ -42,7 +88,7 @@ function Load-CollectionState {
             $state = $rawContent | ConvertFrom-Json -Depth 10
 
             if ($state -eq $null) {
-                Write-Host "Warning: Parsed state is null. Initializing as empty."
+                Log-Message -Type "WRN" -Message "Warning: Parsed state is null. Initializing as empty."
                 return @{}
             }
 
@@ -52,11 +98,11 @@ function Load-CollectionState {
 
             return $state
         } catch {
-            Write-Warning "Failed to load or parse state file: $_. Initializing as empty."
+            Log-Message -Type "ERR" -Message "Failed to load or parse state file: $_. Initializing as empty."
             return @{}
         }
     } else {
-        Write-Host "State file does not exist. Initializing as empty."
+        Log-Message -Type "WRN" -Message "State file does not exist. Initializing as empty."
         return @{}
     }
 }
@@ -71,9 +117,9 @@ function Save-CollectionState {
     }
     try {
         $stringKeyedState | ConvertTo-Json -Depth 10 | Set-Content -Path $CollectionStateFile
-        Write-Host "Successfully saved state: $(ConvertTo-Json $stringKeyedState -Depth 10)"
+        Log-Message -Type "SUC" -Message "Saved state: $(ConvertTo-Json $stringKeyedState -Depth 10)"
     } catch {
-        Write-Error "Failed to save state: $_"
+        Log-Message -Type "ERR" -Message "Failed to save state: $_"
     }
 }
 
@@ -83,7 +129,7 @@ function Get-MaintainerrData {
         $MAINTAINERR_URL = "$MAINTAINERR_URL/api/collections"
     }
 
-    Write-Host "Fetching data from: $MAINTAINERR_URL"
+    Log-Message -Type "INF" -Message "Fetching data from: $MAINTAINERR_URL"
     $response = Invoke-RestMethod -Uri $MAINTAINERR_URL -Method Get
     return $response
 }
@@ -98,18 +144,30 @@ function Calculate-Date {
         [int]$deleteAfterDays
     )
 
+    Log-Message -Type "INF" -Message "Attempting to parse date: $addDate"
     $deleteDate = $addDate.AddDays($deleteAfterDays)
-    $daySuffix = switch ($deleteDate.Day) {
-        1  { "st" }
-        2  { "nd" }
-        3  { "rd" }
-        21 { "st" }
-        22 { "nd" }
-        23 { "rd" }
-        31 { "st" }
-        default { "th" }
+    
+    # Format the date using the specified culture
+    $formattedDate = $deleteDate.ToString($DATE_FORMAT, $cultureInfo)
+
+    if ($ENABLE_DAY_SUFFIX) {
+        $daySuffix = switch ($deleteDate.Day) {
+            1  { "st" }
+            2  { "nd" }
+            3  { "rd" }
+            21 { "st" }
+            22 { "nd" }
+            23 { "rd" }
+            31 { "st" }
+            default { "th" }
+        }
+        $formattedDate = $formattedDate + $daySuffix
     }
-    $formattedDate = $deleteDate.ToString("MMM d") + $daySuffix
+    
+    if ($ENABLE_UPPERCASE) {
+        $formattedDate = $formattedDate.ToUpper()
+    }
+    
     return $formattedDate
 }
 
@@ -120,21 +178,21 @@ function Download-Poster {
     )
 
     try {
-        Write-Host "Downloading poster from: $posterUrl"
+        Log-Message -Type "INF" -Message "Downloading poster from: $posterUrl"
 
         $tempFile = "${savePathBase}.jpg"
         Invoke-WebRequest -Uri $posterUrl -Headers @{"X-Plex-Token"=$PLEX_TOKEN} -OutFile $tempFile -UseBasicParsing
 
         # Check if file size is too small (likely invalid)
         if ((Get-Item $tempFile).Length -lt 1024) {
-            Write-Warning "Downloaded file at $tempFile is too small (<1 KB). Treating as invalid."
+            Log-Message -Type "WRN" -Message "Downloaded file at $tempFile is too small (<1 KB). Treating as invalid."
             Remove-Item -Path $tempFile -Force
             throw "Downloaded file too small to be valid image."
         }
 
         # Identify real file type
         $formatInfo = & magick "$tempFile" -format "%m" info:
-        Write-Host "Actual format detected: $formatInfo"
+        Log-Message -Type "INF" -Message "Actual format detected: $formatInfo"
 
         if ([string]::IsNullOrEmpty($formatInfo)) {
             Remove-Item -Path $tempFile -Force
@@ -146,7 +204,7 @@ function Download-Poster {
             "jpg" { ".jpg" }
             "png" { ".png" }
             "webp" { ".webp" }
-            default { ".jpg" } # Fallback
+            default { ".jpg" } # Safe fallback
         }
 
         # Correct final path
@@ -160,15 +218,15 @@ function Download-Poster {
 
         # Final validate
         if (-not (Validate-Poster -filePath $savePath)) {
-            Write-Warning "Downloaded file at $savePath is not a valid image. Deleting file."
+            Log-Message -Type "WRN" -Message "Downloaded file at $savePath is not a valid image. Deleting file."
             Remove-Item -Path $savePath -Force
             throw "Invalid poster file format detected."
         }
 
-        Write-Host "Successfully downloaded and saved poster to: $savePath"
+        Log-Message -Type "SUC" -Message "Downloaded and saved poster to: $savePath"
         return $savePath
     } catch {
-        Write-Warning "Failed to download poster from $posterUrl. Error: $_"
+        Log-Message -Type "WRN" -Message "Failed to download poster from $posterUrl. Error: $_"
         if (Test-Path $tempFile) {
             Remove-Item -Path $tempFile -Force
         }
@@ -184,11 +242,11 @@ function Revert-ToOriginalPoster {
     )
 
     if (-not (Test-Path -Path $originalImagePath)) {
-        Write-Warning "Original image not found for Plex ID: $plexId. Skipping revert."
+        Log-Message -Type "WRN" -Message "Original image not found for Plex ID: $plexId. Skipping revert."
         return
     }
 
-    Write-Host "Reverting Plex ID: $plexId to original poster."
+    Log-Message -Type "INF" -Message "Reverting Plex ID: $plexId to original poster."
     $uploadUrl = "$PLEX_URL/library/metadata/$plexId/posters?X-Plex-Token=$PLEX_TOKEN"
     $posterBytes = [System.IO.File]::ReadAllBytes($originalImagePath)
     Invoke-RestMethod -Uri $uploadUrl -Method Post -Body $posterBytes -ContentType "image/jpeg"
@@ -297,6 +355,7 @@ function Add-Overlay {
     return $outputImagePath
 }
 
+
 # Function to upload the modified poster back to Plex
 function Upload-Poster {
     param (
@@ -320,9 +379,9 @@ function Upload-Poster {
 
     try {
         Remove-Item -Path $posterPath -ErrorAction Stop
-        Write-Host "Deleted temporary file: $posterPath"
+        Log-Message -Type "INF" -Message "Deleted temporary file: $posterPath"
     } catch {
-        Write-Error "Failed to delete temporary file ${posterPath}: $_"
+        Log-Message -Type "ERR" -Message "Failed to delete temporary file ${posterPath}: $_"
     }
 }
 
@@ -336,11 +395,11 @@ function Validate-Poster {
         if ($LASTEXITCODE -eq 0) {
             return $true
         } else {
-            Write-Warning "File at $filePath is not a valid image (identify failed)."
+            Write-WarLog-Message -Type "ERR" -Messagening "File at $filePath is not a valid image (identify failed)."
             return $false
         }
     } catch {
-        Write-Warning "File at $filePath is not a valid image. Error: $_"
+        Log-Message -Type "ERR" -Message "File at $filePath is not a valid image. Error: $_"
         return $false
     }
 }
@@ -357,7 +416,7 @@ function Janitor-Posters {
         [string]$collectionName     # Name of the collection for context/logging
     )
 
-    Write-Host "Running janitorial logic for collection: $collectionName"
+    Log-Message -Type "INF" -Message "Running janitorial logic for collection: $collectionName"
 
     # Gather all downloaded posters (any image extension)
     $downloadedPosters = Get-ChildItem -Path $originalImagePath -Include *.jpg, *.jpeg, *.png, *.webp -Recurse |
@@ -376,11 +435,11 @@ function Janitor-Posters {
     foreach ($guid in $revertGUIDs) {
         $poster = $downloadedPosters | Where-Object { $_.BaseName -eq $guid }
         if ($poster) {
-            Write-Host "Reverting poster for GUID: $guid"
+            Log-Message -Type "INF" -Message "Reverting poster for GUID: $guid"
             Revert-ToOriginalPoster -plexId $guid -originalImagePath $poster.FullName
             Remove-Item -Path $poster.FullName -ErrorAction SilentlyContinue
         } else {
-            Write-Warning "No poster file found to revert for GUID: $guid"
+            Log-Message -Type "WRN" -Message "No poster file found to revert for GUID: $guid"
         }
     }
 
@@ -388,7 +447,7 @@ function Janitor-Posters {
     foreach ($guid in $unusedGUIDs) {
         $poster = $downloadedPosters | Where-Object { $_.BaseName -eq $guid }
         if ($poster) {
-            Write-Host "Deleting unused poster for GUID: $guid"
+            Log-Message -Type "INF" -Message "Deleting unused poster for GUID: $guid"
             Remove-Item -Path $poster.FullName -ErrorAction SilentlyContinue
         }
     }
@@ -402,7 +461,7 @@ function Process-MediaItems {
     $newState = @{}
 
     foreach ($collection in $maintainerrData) {
-        Write-Host "Processing collection: $($collection.Name)"
+        Log-Message -Type "INF" -Message "Processing collection: $($collection.Name)"
         $deleteAfterDays = $collection.deleteAfterDays
 
         foreach ($item in $collection.media) {
@@ -423,31 +482,31 @@ function Process-MediaItems {
 
             # Add media item to new state
             $newState[$plexId] = $true
-            Write-Host "Added to newState: Plex ID = $plexId, State = true"
+            Log-Message -Type "INF" -Message "Added to newState: Plex ID = $plexId, State = true"
 
             try {
                 # Ensure the original poster is downloaded first
                 if (-not (Test-Path -Path $originalImagePath)) {
-                    Write-Host "Original poster not found for Plex ID: $plexId. Downloading..."
+                    Log-Message -Type "ERR" -Message "Original poster not found for Plex ID: $plexId. Downloading..."
                     $originalImagePath = Download-Poster -posterUrl $posterUrl -savePathBase ("$ORIGINAL_IMAGE_PATH/$plexId")
 
                     if (-not (Test-Path -Path $originalImagePath)) {
                         throw "Failed to download original poster for Plex ID: $plexId"
                     }
                 } else {
-                    Write-Host "Original poster already exists for Plex ID: $plexId."
+                    Log-Message -Type "INF" -Message "Original poster already exists for Plex ID: $plexId."
                 }
 
                 # Calculate the formatted date for overlay
                 $formattedDate = Calculate-Date -addDate $item.addDate -deleteAfterDays $deleteAfterDays
-                Write-Host "Item $plexId has a formatted date: $formattedDate"
+                Log-Message -Type "INF" -Message "Item $plexId has a formatted date: $formattedDate"
 
                 # Apply overlay and upload the modified poster
                 Copy-Item -Path $originalImagePath -Destination $tempImagePath -Force
                 $tempImagePath = Add-Overlay -imagePath $tempImagePath -text "$OVERLAY_TEXT $formattedDate"
                 Upload-Poster -posterPath $tempImagePath -metadataId $plexId
             } catch {
-                Write-Warning "Failed to process Plex ID: $plexId. Error: $_"
+                Log-Message -Type "WRN" -Message "Failed to process Plex ID: $plexId. Error: $_"
             }
         }
     }
@@ -455,23 +514,23 @@ function Process-MediaItems {
     # Compare currentState with newState to identify removed items
     foreach ($plexId in $currentState.Keys) {
         if (-not $newState.ContainsKey($plexId)) {
-            Write-Host "Item $plexId detected as removed (not in newState)."
+            Log-Message -Type "INF" -Message "Item $plexId detected as removed (not in newState)."
 
             # Find the original image
             $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse
             $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { $null }
 
             if ($originalImagePath -and (Test-Path -Path $originalImagePath)) {
-                Write-Host "Reverting Plex ID: $plexId to original poster."
+                Log-Message -Type "INF" -Message "Reverting Plex ID: $plexId to original poster."
                 Revert-ToOriginalPoster -plexId $plexId -originalImagePath $originalImagePath
             } else {
-                Write-Warning "Original poster not found for Plex ID: $plexId. Skipping revert."
+                Log-Message -Type "WRN" -Message "Original poster not found for Plex ID: $plexId. Skipping revert."
             }
 
             # Mark as removed
             $newState[$plexId] = $false
         } else {
-            Write-Host "Item $plexId is still in the collection."
+            Log-Message -Type "INF" -Message "Item $plexId is still in the collection."
         }
     }
 
@@ -485,7 +544,7 @@ function Process-MediaItems {
     foreach ($key in $newState.Keys) {
         $tempState["$key"] = $newState[$key]
     }
-    Write-Host "Saving State: $(ConvertTo-Json $tempState -Depth 10)"
+    Log-Message -Type "INF" -Message "Saving State: $(ConvertTo-Json $tempState -Depth 10)"
     Save-CollectionState -state $newState
 }
 
@@ -504,6 +563,6 @@ if (-not (Test-Path -Path $TEMP_IMAGE_PATH)) {
 # Run the main function in a loop with the specified interval
 while ($true) {
     Process-MediaItems
-    Write-Host "Waiting for $RUN_INTERVAL seconds before the next run."
+    Log-Message -Type "INF" -Message "Waiting for $RUN_INTERVAL seconds before the next run."
     Start-Sleep -Seconds $RUN_INTERVAL
 }
