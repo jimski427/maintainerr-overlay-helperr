@@ -34,40 +34,39 @@ services:
   maintainerr-overlay-helperr:
     image: gsariev/maintainerr-overlay-helperr:latest
     environment:
-      PLEX_URL: "http://plex-server-ip:32400"
-      PLEX_TOKEN: "PLEX-TOKEN"
-      MAINTAINERR_URL: "http://maintainerr-ip:6246/api/collections"
+      PLEX_URL: "http://192.168.0.139:32400"
+      PLEX_TOKEN: "PLEX TOKEN"
+      MAINTAINERR_URL: "http://192.168.0.139:6246"
       IMAGE_SAVE_PATH: "/images"
       ORIGINAL_IMAGE_PATH: "/images/originals"
       TEMP_IMAGE_PATH: "/images/temp"
 
       # Change the values here to customize the overlay
-      FONT_PATH: "/fonts"
+      FONT_PATH: "/fonts/AvenirNextLTPro-Bold.ttf"
       FONT_COLOR: "#ffffff"
       BACK_COLOR: "#B20710"
-      FONT_SIZE: "65"
+      FONT_SIZE: "55"
       PADDING: "15"
-      BACK_RADIUS: "20"
-      HORIZONTAL_OFFSET: "80"
+      BACK_RADIUS: "30"
+      HORIZONTAL_OFFSET: "30"
       HORIZONTAL_ALIGN: "center"
       VERTICAL_OFFSET: "40"
-      VERTICAL_ALIGN: "bottom"
+      VERTICAL_ALIGN: "top"
 
-      BACK_WIDTH: "1500"    # Set your desired width in pixels
-      BACK_HEIGHT: "100"    # Set your desired height in pixels
-      DATE_FORMAT: "d MMM"    # Set your desired date format between "d MMM" or "MMM d"
-      OVERLAY_TEXT: "RETIRÉ LE"    # Set your desired text to display before removal date
-      FONT_NAME: "Roboto-Bold"    # Font file name with .ttf extension. Fonts available from /fonts directory. Added Kometa's and PATTRMM's ones for consistency if you're already using one or both of these tools.
-      ENABLE_DAY_SUFFIX: false    # Enable or disable date suffix (i.e. th from November 14th). Mainly for french people
-      ENABLE_UPPERCASE: true    # Use uppercase or lowercase for date format
+      DATE_FORMAT: "MMM d"    # Set your desired date format between "d MMM" or "MMM d"
+      OVERLAY_TEXT: "Leaving"    # Set your desired text to display before removal date
+  
+      ENABLE_DAY_SUFFIX: true    # Enable or disable date suffix (i.e. th from November 14th). Mainly for french people
+      ENABLE_UPPERCASE: false    # Use uppercase or lowercase for date format
 
-      LANGUAGE: "fr-FR"    # Used for date format and month abbreviation language. You can change this as needed (e.g., "fr-FR" for French), will default to en-US if not provided.
-
-      RUN_INTERVAL: "2"    # Set the run interval to after X minutes; default is 480 minutes (8 hours) if not specified
+      LANGUAGE: "en-US"    # Used for date format and month abbreviation language. You can change this as needed (e.g., "fr-FR" for French), will default to en-US if not provided.
+      
+      RUN_INTERVAL: "10"    # Set the run interval to after X minutes; default is 480 minutes (8 hours) if not specified
+      
     volumes:
-      - /docker_data2/maintainerr-overlay-helper/config/images:/images
-      - /docker_data2/maintainerr-overlay-helper/config/fonts:/fonts
-    network_mode: "bridge"
+      - /mnt/user/appdata/maintainerr/images:/images
+      - /mnt/user/appdata/maintainerr/fonts:/fonts
+
 ```
 2. Run the container
 ```yaml
