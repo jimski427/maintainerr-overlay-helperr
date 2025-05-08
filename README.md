@@ -72,6 +72,10 @@ services:
 ```yaml
 docker-compose up --build
 ```
+
+#### Unraid
+Maintainerr-Overlay-Helperr cummunty all available thanks to [nwithan8](https://github.com/nwithan8/unraid_templates)
+
 #### Ensure Directories Exist
 
 - Ensure the directories specified in IMAGE_SAVE_PATH, ORIGINAL_IMAGE_PATH, and TEMP_IMAGE_PATH exist on your system.
