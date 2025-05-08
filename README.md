@@ -74,7 +74,7 @@ docker-compose up --build
 ```
 
 #### Unraid
-Maintainerr-Overlay-Helperr cummunty all available thanks to [nwithan8](https://github.com/nwithan8/unraid_templates)
+Maintainerr-Overlay-Helperr community app available thanks to [nwithan8](https://github.com/nwithan8/unraid_templates)
 
 #### Ensure Directories Exist
 
