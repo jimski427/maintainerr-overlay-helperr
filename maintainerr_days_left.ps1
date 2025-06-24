@@ -21,6 +21,7 @@ $ENABLE_DAY_SUFFIX = [bool]($env:ENABLE_DAY_SUFFIX -eq "true")
 $ENABLE_UPPERCASE = [bool]($env:ENABLE_UPPERCASE -eq "true")
 $LANGUAGE = $env:LANGUAGE 
 $DATE_FORMAT = $env:DATE_FORMAT
+$REORDER_COLLECTIONS = $env:REORDER_COLLECTIONS
 
 # Set defaults if not provided
 if (-not $DATE_FORMAT) {
@@ -36,6 +37,13 @@ if (-not $RUN_INTERVAL) {
     $RUN_INTERVAL = 8 * 60 * 60 # Default to 8 hours in seconds
 } else {
     $RUN_INTERVAL = $RUN_INTERVAL * 60 # Convert minutes to seconds
+}
+
+if (-not $REORDER_COLLECTIONS) {
+    # Default: include all (by setting to empty array, or ["*"])
+    $collectionsToReorder = @("*")
+} else {
+    $collectionsToReorder = $REORDER_COLLECTIONS -split "," | ForEach-Object { $_.Trim() }
 }
 
 # Define culture based on selected language
@@ -83,8 +91,6 @@ function Load-CollectionState {
         try {
             $rawContent = Get-Content -Path $CollectionStateFile -Raw
             Write-Host "Raw State File Content: $rawContent"
-
-            # Enforce parsing into a valid object
             $state = $rawContent | ConvertFrom-Json -Depth 10
 
             if ($state -eq $null) {
@@ -93,7 +99,11 @@ function Load-CollectionState {
             }
 
             if ($state -is [PSCustomObject]) {
-                return $state.PSObject.Properties | ForEach-Object { @{ $_.Name = $_.Value } }
+                $result = @{}
+                foreach ($prop in $state.PSObject.Properties) {
+                    $result[$prop.Name] = $prop.Value
+                }
+                return $result
             }
 
             return $state
@@ -106,6 +116,7 @@ function Load-CollectionState {
         return @{}
     }
 }
+
 
 function Save-CollectionState {
     param (
@@ -123,16 +134,6 @@ function Save-CollectionState {
     }
 }
 
-# Function to get data from Maintainerr
-function Get-MaintainerrData {
-    if ($MAINTAINERR_URL -notmatch "/api/collections$") {
-        $MAINTAINERR_URL = "$MAINTAINERR_URL/api/collections"
-    }
-
-    Log-Message -Type "INF" -Message "Fetching data from: $MAINTAINERR_URL"
-    $response = Invoke-RestMethod -Uri $MAINTAINERR_URL -Method Get
-    return $response
-}
 
 # Function to calculate the calendar date
 function Calculate-Date {
@@ -395,7 +396,7 @@ function Validate-Poster {
         if ($LASTEXITCODE -eq 0) {
             return $true
         } else {
-            Write-WarLog-Message -Type "ERR" -Messagening "File at $filePath is not a valid image (identify failed)."
+            Log-Message -Type "ERR" -Messagening "File at $filePath is not a valid image (identify failed)."
             return $false
         }
     } catch {
@@ -453,93 +454,140 @@ function Janitor-Posters {
     }
 }
 
-function Process-MediaItems {
-    $maintainerrData = Get-MaintainerrData
-    $currentState = Load-CollectionState
+# --- New Function: Sort Collection in Plex ---
 
-    # Initialize new state
+
+function Process-MediaItems {
+    $collectionsUrl = "$MAINTAINERR_URL/api/collections"
+    Log-Message -Type "DBG" -Message "Resolved collectionsUrl = '$collectionsUrl'"
+
+    try {
+        $maintainerrData = Invoke-RestMethod -Uri $collectionsUrl -Method Get
+        Log-Message -Type "INF" -Message "Fetched collection data from Maintainerr."
+    } catch {
+        Log-Message -Type "ERR" -Message "Failed to fetch Maintainerr data from $collectionsUrl. Error: $_"
+        return
+    }
+
+    # Load current state and ensure keys are strings
+    $loadedState = Load-CollectionState
+    $currentState = @{}
+    foreach ($entry in $loadedState.GetEnumerator()) {
+        $currentState["$($entry.Key)"] = $entry.Value
+    }
+
     $newState = @{}
 
     foreach ($collection in $maintainerrData) {
-        Log-Message -Type "INF" -Message "Processing collection: $($collection.Name)"
+        Log-Message -Type "INF" -Message "Processing collection: $($collection.title)"
         $deleteAfterDays = $collection.deleteAfterDays
+        $LibrarySectionId = $collection.libraryId
+        if (-not $LibrarySectionId) { $LibrarySectionId = "2" } # Fallback
+        $CollectionName = $collection.title
 
+        # Respect collection filter
+        if ("*" -notin $collectionsToReorder -and $CollectionName -notin $collectionsToReorder) {
+            Log-Message -Type "INF" -Message "Skipping collection: $CollectionName"
+            continue
+        }
+
+        $mediaList = @()
         foreach ($item in $collection.media) {
             $plexId = $item.plexId.ToString()
-
-            # Find the original poster file, whatever the extension
-            $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse
-            $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { $null }
-
-            # If no poster found yet, define default jpg
-            if (-not $originalImagePath) {
-                $originalImagePath = "$ORIGINAL_IMAGE_PATH/$plexId.jpg"
-            }
-
-            $ext = [System.IO.Path]::GetExtension($originalImagePath)
-            $tempImagePath = "$TEMP_IMAGE_PATH/$plexId$ext"
-            $posterUrl = "$PLEX_URL/library/metadata/$plexId/thumb?X-Plex-Token=$PLEX_TOKEN"
-
-            # Add media item to new state
-            $newState[$plexId] = $true
-            Log-Message -Type "INF" -Message "Added to newState: Plex ID = $plexId, State = true"
-
-            try {
-                # Ensure the original poster is downloaded first
-                if (-not (Test-Path -Path $originalImagePath)) {
-                    Log-Message -Type "ERR" -Message "Original poster not found for Plex ID: $plexId. Downloading..."
-                    $originalImagePath = Download-Poster -posterUrl $posterUrl -savePathBase ("$ORIGINAL_IMAGE_PATH/$plexId")
-
-                    if (-not (Test-Path -Path $originalImagePath)) {
-                        throw "Failed to download original poster for Plex ID: $plexId"
-                    }
-                } else {
-                    Log-Message -Type "INF" -Message "Original poster already exists for Plex ID: $plexId."
-                }
-
-                # Calculate the formatted date for overlay
-                $formattedDate = Calculate-Date -addDate $item.addDate -deleteAfterDays $deleteAfterDays
-                Log-Message -Type "INF" -Message "Item $plexId has a formatted date: $formattedDate"
-
-                # Apply overlay and upload the modified poster
-                Copy-Item -Path $originalImagePath -Destination $tempImagePath -Force
-                $tempImagePath = Add-Overlay -imagePath $tempImagePath -text "$OVERLAY_TEXT $formattedDate"
-                Upload-Poster -posterPath $tempImagePath -metadataId $plexId
-            } catch {
-                Log-Message -Type "WRN" -Message "Failed to process Plex ID: $plexId. Error: $_"
+            $deleteDate = $item.addDate.AddDays($deleteAfterDays)
+            $mediaList += [PSCustomObject]@{
+                PlexId     = $plexId
+                DeleteDate = $deleteDate
+                Item       = $item
             }
         }
+
+        $sortedMedia = $mediaList | Sort-Object -Property DeleteDate
+
+        foreach ($media in $sortedMedia) {
+    $item = $media.Item
+    $plexId = $media.PlexId
+
+    if ($currentState["$plexId"] -eq $true -or $currentState["$plexId"] -eq "true") {
+    Log-Message -Type "INF" -Message "Skipping Plex ID: $plexId (already processed)."
+    $newState["$plexId"] = $true
+    continue
+}
+
+
+    # Locate original poster
+    $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse
+    $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { "$ORIGINAL_IMAGE_PATH/$plexId.jpg" }
+    $ext = [System.IO.Path]::GetExtension($originalImagePath)
+    $tempImagePath = "$TEMP_IMAGE_PATH/$plexId$ext"
+    $posterUrl = "$PLEX_URL/library/metadata/$plexId/thumb?X-Plex-Token=$PLEX_TOKEN"
+
+    try {
+        if (-not (Test-Path -Path $originalImagePath)) {
+            Log-Message -Type "ERR" -Message "Original poster not found for Plex ID: $plexId. Downloading..."
+            $originalImagePath = Download-Poster -posterUrl $posterUrl -savePathBase ("$ORIGINAL_IMAGE_PATH/$plexId")
+            if (-not (Test-Path -Path $originalImagePath)) {
+                throw "Failed to download original poster for Plex ID: $plexId"
+            }
+        } else {
+            Log-Message -Type "INF" -Message "Original poster already exists for Plex ID: $plexId."
+        }
+
+        $formattedDate = Calculate-Date -addDate $item.addDate -deleteAfterDays $deleteAfterDays
+        Log-Message -Type "INF" -Message "Item $plexId has a formatted date: $formattedDate"
+
+        Copy-Item -Path $originalImagePath -Destination $tempImagePath -Force
+        $tempImagePath = Add-Overlay -imagePath $tempImagePath -text "$OVERLAY_TEXT $formattedDate"
+        Upload-Poster -posterPath $tempImagePath -metadataId $plexId
+
+        $newState[$plexId] = $true
+        Log-Message -Type "INF" -Message "Added to newState: Plex ID = $plexId, State = true"
+    } catch {
+        Log-Message -Type "WRN" -Message "Failed to process Plex ID: $plexId. Error: $_"
+    }
+}
+
+
+
+        # Sort collection in Plex
+        $sortedPlexIds = $sortedMedia | Select-Object -ExpandProperty PlexId
+        Set-PlexCollectionOrder `
+            -MAINTAINERR_URL $MAINTAINERR_URL `
+            -PLEX_URL $PLEX_URL `
+            -PLEX_TOKEN $PLEX_TOKEN `
+            -LibrarySectionId $LibrarySectionId `
+            -CollectionName $CollectionName `
+            -SortedPlexIds $sortedPlexIds
     }
 
-    # Compare currentState with newState to identify removed items
+    # Handle removals (restore and delete)
     foreach ($plexId in $currentState.Keys) {
         if (-not $newState.ContainsKey($plexId)) {
             Log-Message -Type "INF" -Message "Item $plexId detected as removed (not in newState)."
-
-            # Find the original image
             $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse
             $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { $null }
 
             if ($originalImagePath -and (Test-Path -Path $originalImagePath)) {
                 Log-Message -Type "INF" -Message "Reverting Plex ID: $plexId to original poster."
                 Revert-ToOriginalPoster -plexId $plexId -originalImagePath $originalImagePath
+                Remove-Item -Path $originalImagePath -Force -ErrorAction SilentlyContinue
             } else {
                 Log-Message -Type "WRN" -Message "Original poster not found for Plex ID: $plexId. Skipping revert."
             }
 
-            # Mark as removed
-            $newState[$plexId] = $false
+            # Do not re-add to newState (removes from final JSON)
+            continue
         } else {
             Log-Message -Type "INF" -Message "Item $plexId is still in the collection."
         }
     }
 
-    # Run janitorial logic
+    # Run janitorial cleanup
     $plexGUIDs = $currentState.Keys
     $maintainerrGUIDs = $newState.Keys
     Janitor-Posters -mediaList $plexGUIDs -maintainerrGUIDs $maintainerrGUIDs -newState $newState -originalImagePath $ORIGINAL_IMAGE_PATH -collectionName "All Media"
 
-    # Save the new state
+    # Save updated state
     $tempState = @{}
     foreach ($key in $newState.Keys) {
         $tempState["$key"] = $newState[$key]
@@ -549,7 +597,8 @@ function Process-MediaItems {
 }
 
 
-# Ensure the images directories exist
+
+# --- Directory setup and main loop (unchanged) ---
 if (-not (Test-Path -Path $IMAGE_SAVE_PATH)) {
     New-Item -ItemType Directory -Path $IMAGE_SAVE_PATH
 }
@@ -560,9 +609,76 @@ if (-not (Test-Path -Path $TEMP_IMAGE_PATH)) {
     New-Item -ItemType Directory -Path $TEMP_IMAGE_PATH
 }
 
-# Run the main function in a loop with the specified interval
-while ($true) {
-    Process-MediaItems
-    Log-Message -Type "INF" -Message "Waiting for $RUN_INTERVAL seconds before the next run."
-    Start-Sleep -Seconds $RUN_INTERVAL
+function Set-PlexCollectionOrder {
+    param(
+        [string]$MAINTAINERR_URL,
+        [string]$PLEX_TOKEN,
+        [string]$PLEX_URL,
+        [string]$LibrarySectionId,
+        [string]$CollectionName,
+        [array]$SortedPlexIds
+    )
+
+    # Read order direction from environment variable (default: asc)
+    $order = $env:PLEX_COLLECTION_ORDER
+    if (-not $order) { $order = "asc" }
+    $order = $order.ToLower()
+
+    # Sort/reverse the array as requested
+    switch ($order) {
+    "asc"   { $finalOrder = $SortedPlexIds }
+    "desc"  { 
+        $finalOrder = $SortedPlexIds.Clone()
+        [Array]::Reverse($finalOrder)
+    }
+    default { 
+        Log-Message -Type "WRN" -Message "Unknown order '$order', defaulting to ascending."
+        $finalOrder = $SortedPlexIds
+    }
 }
+
+    # 1. Look up the collection using Maintanerr API
+    $collectionsUrl = "$MAINTAINERR_URL/api/plex/library/$LibrarySectionId/collections"
+    try {
+        $collectionsResponse = Invoke-RestMethod -Uri $collectionsUrl -ErrorAction Stop
+        $foundCollection = $collectionsResponse | Where-Object { $_.title -ieq $CollectionName }
+
+        if (-not $foundCollection) {
+            Log-Message -Type "ERR" -Message "Could not find collection '$CollectionName' in library section $LibrarySectionId."
+            return
+        }
+        $collectionId = $foundCollection.ratingKey
+        Log-Message -Type "INF" -Message "Found collection '$CollectionName' (ratingKey $collectionId) in library section $LibrarySectionId."
+    } catch {
+        Log-Message -Type "ERR" -Message "Failed to retrieve collections from Maintanerr in section ${LibrarySectionId}: $_"
+        return
+    }
+
+    # 2. Set collection to custom sort (collectionSort=2)
+    $setCustomSortUrl = "$PLEX_URL/library/metadata/$collectionId/prefs?X-Plex-Token=$PLEX_TOKEN"
+    $body = "collectionSort=2"
+    try {
+        Invoke-RestMethod -Uri $setCustomSortUrl -Method PUT -Body $body -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop
+        Log-Message -Type "INF" -Message "Set collection '$CollectionName' to custom sort mode."
+    } catch {
+        Log-Message -Type "ERR" -Message "Failed to set collection '$CollectionName' to custom sort: $_"
+        return
+    }
+
+    # 3. Move each item after the previous one, as Plex Web does
+    for ($i = 1; $i -lt $finalOrder.Count; $i++) {
+        $itemId = $finalOrder[$i]
+        $afterId = $finalOrder[$i-1]
+        $moveUrl = "$PLEX_URL/library/collections/$collectionId/items/$itemId/move?after=$afterId"+"&X-Plex-Token=$PLEX_TOKEN"
+        try {
+            Invoke-RestMethod -Uri $moveUrl -Method PUT -ErrorAction Stop
+            Log-Message -Type "INF" -Message "Moved item $itemId after $afterId in collection $collectionId."
+        } catch {
+            Log-Message -Type "ERR" -Message "Failed to move item $itemId after '$afterId': $_"
+        }
+    }
+
+    Log-Message -Type "SUC" -Message "Finished reordering collection '$CollectionName' ($order) with custom sort."
+}
+
+Process-MediaItems
