@@ -15,7 +15,6 @@ $HORIZONTAL_OFFSET = [int]$env:HORIZONTAL_OFFSET
 $HORIZONTAL_ALIGN = $env:HORIZONTAL_ALIGN
 $VERTICAL_OFFSET = [int]$env:VERTICAL_OFFSET
 $VERTICAL_ALIGN = $env:VERTICAL_ALIGN
-$RUN_INTERVAL = [int]$env:RUN_INTERVAL
 $OVERLAY_TEXT = $env:OVERLAY_TEXT
 $ENABLE_DAY_SUFFIX = [bool]($env:ENABLE_DAY_SUFFIX -eq "true")
 $ENABLE_UPPERCASE = [bool]($env:ENABLE_UPPERCASE -eq "true")
@@ -32,11 +31,6 @@ if (-not $LANGUAGE) {
 }
 if (-not $OVERLAY_TEXT) {
     $OVERLAY_TEXT = "Leaving"
-}
-if (-not $RUN_INTERVAL) {
-    $RUN_INTERVAL = 8 * 60 * 60 # Default to 8 hours in seconds
-} else {
-    $RUN_INTERVAL = $RUN_INTERVAL * 60 # Convert minutes to seconds
 }
 
 if (-not $REORDER_COLLECTIONS) {
@@ -356,7 +350,6 @@ function Add-Overlay {
     return $outputImagePath
 }
 
-
 # Function to upload the modified poster back to Plex
 function Upload-Poster {
     param (
@@ -386,7 +379,6 @@ function Upload-Poster {
     }
 }
 
-
 function Validate-Poster {
     param (
         [string]$filePath
@@ -404,8 +396,6 @@ function Validate-Poster {
         return $false
     }
 }
-
-
 
 # Function to perform janitorial tasks: revert and delete unused posters
 function Janitor-Posters {
@@ -453,9 +443,6 @@ function Janitor-Posters {
         }
     }
 }
-
-# --- New Function: Sort Collection in Plex ---
-
 
 function Process-MediaItems {
     $collectionsUrl = "$MAINTAINERR_URL/api/collections"
@@ -514,7 +501,6 @@ function Process-MediaItems {
     continue
 }
 
-
     # Locate original poster
     $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse
     $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { "$ORIGINAL_IMAGE_PATH/$plexId.jpg" }
@@ -546,8 +532,6 @@ function Process-MediaItems {
         Log-Message -Type "WRN" -Message "Failed to process Plex ID: $plexId. Error: $_"
     }
 }
-
-
 
         # Sort collection in Plex
         $sortedPlexIds = $sortedMedia | Select-Object -ExpandProperty PlexId
@@ -596,9 +580,6 @@ function Process-MediaItems {
     Save-CollectionState -state $newState
 }
 
-
-
-# --- Directory setup and main loop (unchanged) ---
 if (-not (Test-Path -Path $IMAGE_SAVE_PATH)) {
     New-Item -ItemType Directory -Path $IMAGE_SAVE_PATH
 }
