@@ -60,8 +60,12 @@ services:
       ENABLE_UPPERCASE: false    # Use uppercase or lowercase for date format
 
       LANGUAGE: "en-US"    # Used for date format and month abbreviation language. You can change this as needed (e.g., "fr-FR" for French), will default to en-US if not provided.
-      
-      RUN_INTERVAL: "10"    # Set the run interval to after X minutes; default is 480 minutes (8 hours) if not specified
+
+      CRON_SCHEDULE: "0 */8 * * *" #Configure the schedule CRON should execute the script; default is          every 8 hours
+      RUN_ON_CREATION: "false" #Set to true if you want the script to execute once on initial boot; will        use CRON after or set to false to use only CRON
+
+      PLEX_COLLECTION_ORDER: "asc" #Choose between ascending (asc) and descending (desc)
+      REORDER_COLLECTIONS: "Leaving Soon" #Name of the colletion to be reodered. You can specify         multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
       
     volumes:
       - /mnt/user/appdata/maintainerr/images:/images
