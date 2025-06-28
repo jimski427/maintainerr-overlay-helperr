@@ -64,6 +64,8 @@ services:
       CRON_SCHEDULE: "0 */8 * * *" #Configure the schedule CRON should execute the script; default is          every 8 hours
       RUN_ON_CREATION: "false" #Set to true if you want the script to execute once on initial boot; will        use CRON after or set to false to use only CRON
 
+      REAPPLY_OVERLAY: "false" #Will reapply overlays every time the script runs if set to true
+
       PLEX_COLLECTION_ORDER: "asc" #Choose between ascending (asc) and descending (desc)
       REORDER_COLLECTIONS: "Leaving Soon" #Name of the colletion to be reodered. You can specify         multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
       
