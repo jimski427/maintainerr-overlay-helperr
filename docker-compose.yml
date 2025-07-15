@@ -35,7 +35,7 @@ services:
       RUN_ON_CREATION: "false" #Set to true if you want the script to execute once on initial boot; will use CRON after or set to false to use only CRON
 
       PLEX_COLLECTION_ORDER: "asc" #Choose between ascending (asc) and descending (desc)
-      REORDER_COLLECTIONS: "Leaving Soon" #Name of the colletion to be reodered. You can specify multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
+      PROCESS_COLLECTIONS: "Leaving Soon" #Name of the colletion to be processed. You can specify multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
       
     volumes:
       - /mnt/user/appdata/maintainerr/images:/images
