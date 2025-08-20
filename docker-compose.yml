@@ -22,6 +22,8 @@ services:
       HORIZONTAL_ALIGN: "center"
       VERTICAL_OFFSET: "40"
       VERTICAL_ALIGN: "top"
+      RESET_OVERLAY: "false" 
+      REAPPLY_OVERLAY: "false"
 
       DATE_FORMAT: "MMM d"    # Set your desired date format between "d MMM" or "MMM d"
       OVERLAY_TEXT: "Leaving"    # Set your desired text to display before removal date
@@ -40,3 +42,4 @@ services:
     volumes:
       - /mnt/user/appdata/maintainerr/images:/images
       - /mnt/user/appdata/maintainerr/fonts:/fonts
+
