@@ -45,6 +45,7 @@ services:
       TEMP_IMAGE_PATH: "/images/temp"
 
       RUN_ON_CREATION: "true" #Enable to run the overlay logic upon booting the container; disable to wait for the CRON run
+      CRON_SCHEDULE: "0 */8 * * *" #Configure the schedule CRON should execute the script; default is every 8 hours
       REAPPLY_OVERLAY: "false" #Enable to force the re-processing of processed overlays
       RESET_OVERLAY: "false" #Enable to reset all overlays and use the original media posters
       USE_DAYS: "true" #Enable to use days left; disable to use calculated date
@@ -65,22 +66,14 @@ services:
       OVERLAY_TEXT: "Leaving"    # Set your desired text to display before removal date
 
       #Customize messages for when using days
-      TEXT_TODAY: "last chance to watch"
-      TEXT_DAY: "gone tomorrow"
-      TEXT_DAYS: "Gone in {0} days"
-
-      DATE_FORMAT: "MMM d"    # Set your desired date format between "d MMM" or "MMM d"
-      OVERLAY_TEXT: "Leaving"    # Set your desired text to display before removal date
-  
+      TEXT_TODAY: "last chance to watch" #When media is being deleted today
+      TEXT_DAY: "gone tomorrow" #When there is 1 day left until deletion
+      TEXT_DAYS: "Gone in {0} days" #Show the days remaining until deletion
+        
       ENABLE_DAY_SUFFIX: true    # Enable or disable date suffix (i.e. th from November 14th). Mainly for french people
       ENABLE_UPPERCASE: false    # Use uppercase or lowercase for date format
 
       LANGUAGE: "en-US"    # Used for date format and month abbreviation language. You can change this as needed (e.g., "fr-FR" for French), will default to en-US if not provided.
-
-      CRON_SCHEDULE: "0 */8 * * *" #Configure the schedule CRON should execute the script; default is          every 8 hours
-      RUN_ON_CREATION: "false" #Set to true if you want the script to execute once on initial boot; will        use CRON after or set to false to use only CRON
-
-      REAPPLY_OVERLAY: "false" #Will reapply overlays every time the script runs if set to true
 
       PLEX_COLLECTION_ORDER: "asc" #Choose between ascending (asc) and descending (desc)
       PROCESS_COLLECTIONS: "Leaving Soon" #Name of the colletion to be reodered. You can specify  multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
