@@ -13,10 +13,11 @@ This project is a helper script that works in combination with [Maintainerr](htt
 ### Features
 
 - **Collections**: supports all collection types, can process multiple collections & can reorder Plex collection in either ascending or descending order depending on deletion date
-- **Customizable overlay**: use custom text, color, size and shape of the overlay
+- **Customizable overlay**: use custom text, color, size, shape & positioning of the overlay
 - **Overlay reset & deletion**: revert back to the original poster & delete the generated overlay poster from Plex metadata folder
 - **Automatic poster update**: change the deletion date in the overlay automatically when making changes to the Maintainerr rule(s)
-- **Display days left vs exact date**: choose between showing the calculated date of removal or days leading up to it
+- **Display days left vs exact date**: choose between showing the calculated date of removal (Netflix style) or days leading up to it (countdown)
+- **CRON scheduling**: schedule when the script should run using CRON expressions
 
 ### Requirements
 
