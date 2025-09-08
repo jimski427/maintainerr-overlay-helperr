@@ -16,7 +16,7 @@ This project is a helper script that works in combination with [Maintainerr](htt
 - **Customizable overlay**: use custom text, color, size and shape of the overlay
 - **Overlay reset & deletion**: revert back to the original poster & delete the generated overlay poster from Plex metadata folder
 - **Automatic poster update**: change the deletion date in the overlay automatically when making changes to the Maintainerr rule(s)
-- **Display days left vs exact date**: choose between showing the calulcated date of removal or days leading up to it
+- **Display days left vs exact date**: choose between showing the calculated date of removal or days leading up to it
 
 ### Requirements
 
