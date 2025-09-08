@@ -83,7 +83,7 @@ services:
       REAPPLY_OVERLAY: "false" #Will reapply overlays every time the script runs if set to true
 
       PLEX_COLLECTION_ORDER: "asc" #Choose between ascending (asc) and descending (desc)
-      REORDER_COLLECTIONS: "Leaving Soon" #Name of the colletion to be reodered. You can specify  multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
+      PROCESS_COLLECTIONS: "Leaving Soon" #Name of the colletion to be reodered. You can specify  multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
       
     volumes:
       - /mnt/user/appdata/maintainerr/images:/images
