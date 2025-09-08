@@ -50,10 +50,11 @@ services:
       REAPPLY_OVERLAY: "false" #Will reapply overlays every time the script runs if set to true
 
       PLEX_COLLECTION_ORDER: "asc" #Choose between ascending (asc) and descending (desc)
-      REORDER_COLLECTIONS: "Leaving Soon" #Name of the colletion to be reodered. You can specify  multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
+      PROCESS_COLLECTIONS: "Leaving Soon" #Name of the colletion to be reodered. You can specify  multiple seperated by , "Leaving Soon, Not Watched, Bad Movies"
       
     volumes:
       - /mnt/user/appdata/maintainerr/images:/images
       - /mnt/user/appdata/maintainerr/fonts:/fonts
       - /mnt/user/appdata/Plex-Media-Server/Library/Application Support/Plex Media Server/Metadata:/plexmeta #path to plex metadata folder
       - /mnt/user/appdata/Plex-Media-Server/Library/Application Support/Plex Media Server/Plug-in Support/Databases:/plex-db #path to plex database folder
+
