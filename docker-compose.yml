@@ -10,7 +10,7 @@ services:
       IMAGE_SAVE_PATH: "/images"
       ORIGINAL_IMAGE_PATH: "/images/originals"
       TEMP_IMAGE_PATH: "/images/temp"
-
+      TZ: "Europe/Copenhagen" #Replace with your timezone
       RUN_ON_CREATION: "true" #Enable to run the overlay logic upon booting the container; disable to wait for the CRON run
       REAPPLY_OVERLAY: "false" #Enable to force the re-processing of processed overlays
       RESET_OVERLAY: "false" #Enable to reset all overlays and use the original media posters
@@ -56,5 +56,5 @@ services:
       - /mnt/user/appdata/maintainerr/images:/images
       - /mnt/user/appdata/maintainerr/fonts:/fonts
       - /mnt/user/appdata/Plex-Media-Server/Library/Application Support/Plex Media Server/Metadata:/plexmeta #path to plex metadata folder
-      - /mnt/user/appdata/Plex-Media-Server/Library/Application Support/Plex Media Server/Plug-in Support/Databases:/plex-db #path to plex database folder
+
 
