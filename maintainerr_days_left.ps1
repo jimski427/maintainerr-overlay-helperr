@@ -25,6 +25,8 @@ $PROCESS_COLLECTIONS = $env:PROCESS_COLLECTIONS
 $REAPPLY_OVERLAY   = [bool]($env:REAPPLY_OVERLAY -eq "true")
 $RESET_OVERLAY   = [bool]($env:RESET_OVERLAY -eq "true")
 
+$USE_DAYS = [bool]($env:USE_DAYS -eq "true")
+
 
 $ErrorActionPreference = 'Stop'
 trap {
@@ -123,6 +125,14 @@ if ($REAPPLY_OVERLAY) {
     Log-Message -Type "INF" -Message "Reapply overlay is enabled. Overlays will be reapplied for all media."
 }
 
+# Detect and log timezone info
+try {
+    $tzName = if ($env:TZ) { $env:TZ } else { (Get-TimeZone).Id }
+    Log-Message -Type "INF" -Message "Cron is running based on local time zone ($tzName)."
+} catch {
+    Log-Message -Type "WRN" -Message "Unable to determine local timezone; defaulting to UTC."
+}
+
 
 function Get-BestPlexImageUrl {
     param([Parameter(Mandatory=$true)][string]$MetadataId)
@@ -193,7 +203,6 @@ function Get-BestPlexImageUrl {
 
     return $null
 }
-
 
 function Load-CollectionState {
     if (Test-Path -Path $CollectionStateFile) {
@@ -286,6 +295,79 @@ function Calculate-Date {
     }
     
     return $formattedDate
+}
+
+function Get-DaysLeft {
+    param(
+        [Parameter(Mandatory=$true)][datetime]$addDate,
+        [Parameter(Mandatory=$true)][int]$deleteAfterDays
+    )
+    # End of life moment = addDate + deleteAfterDays 
+    $deleteDate = $addDate.AddDays($deleteAfterDays)
+
+    # Round up so at 1.1 days it still says "in 2 days"
+    $daysLeft = [math]::Ceiling( ($deleteDate.ToUniversalTime() - [datetime]::UtcNow).TotalDays )
+
+    if ($daysLeft -lt 0) { $daysLeft = 0 }
+
+    # Return both pieces
+    return @{
+        DaysLeft   = [int]$daysLeft
+        DeleteDate = $deleteDate
+    }
+}
+
+function Select-UploadedPoster {
+    param([Parameter(Mandatory=$true)][string]$MetadataId,[Parameter(Mandatory=$true)][string]$UploadPosterId)
+    $selUrl = "$PLEX_URL/library/metadata/$MetadataId/poster?url=$( [uri]::EscapeDataString("upload://posters/$UploadPosterId") )"
+    try {
+        Invoke-RestMethod -Uri $selUrl -Method PUT -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } -ErrorAction Stop | Out-Null
+        Log-Message -Type "SUC" -Message "Selected uploaded poster $UploadPosterId for $MetadataId ."
+        return $true
+    } catch {
+        Log-Message -Type "WRN" -Message "Failed to select uploaded poster $UploadPosterId for ${MetadataId}: $_"
+        return $false
+    }
+}
+
+function Format-LeavingText {
+    param(
+        [Parameter(Mandatory=$true)][int]$daysLeft,
+        [datetime]$addDate,                  # required for USE_DAYS=$false mode
+        [int]$deleteAfterDays,               # required for USE_DAYS=$false mode
+        [bool]$Uppercase = $ENABLE_UPPERCASE
+    )
+
+    if ($USE_DAYS) {
+        # --- Customizable text mode ---
+        $TEXT_TODAY = $env:TEXT_TODAY ; if (-not $TEXT_TODAY) { $TEXT_TODAY = "TODAY" }
+        $TEXT_DAY   = $env:TEXT_DAY   ; if (-not $TEXT_DAY)   { $TEXT_DAY   = "in 1 day" }
+        $TEXT_DAYS  = $env:TEXT_DAYS  ; if (-not $TEXT_DAYS)  { $TEXT_DAYS  = "in {0} days" }
+
+        if ($daysLeft -le 0) {
+            $text = $TEXT_TODAY
+        } elseif ($daysLeft -eq 1) {
+            $text = $TEXT_DAY
+        } else {
+            $text = [string]::Format($TEXT_DAYS, $daysLeft)
+        }
+    }
+    else {
+        # --- Classic date mode ---
+        $formattedDate = Calculate-Date -addDate $addDate -deleteAfterDays $deleteAfterDays
+        $text = "$OVERLAY_TEXT $formattedDate"
+    }
+
+    # Apply uppercase if requested
+    if ($Uppercase) {
+        try {
+            if ($script:cultureInfo) { return $text.ToUpper($script:cultureInfo) }
+            if ($global:cultureInfo) { return $text.ToUpper($global:cultureInfo) }
+        } catch { }
+        return $text.ToUpper()
+    }
+
+    return $text
 }
 
 function Get-TargetCollectionName {
@@ -464,8 +546,9 @@ function Reset-AllOverlays {
 
 function Add-Overlay {
     param (
-        [string]$imagePath,
-        [string]$text,
+        [Parameter(Mandatory=$true)][string]$imagePath,
+        [Parameter(Mandatory=$true)][string]$text,
+
         [string]$fontColor = $FONT_COLOR,
         [string]$backColor = $BACK_COLOR,
         [string]$fontPath  = $FONT_PATH,
@@ -476,7 +559,10 @@ function Add-Overlay {
         [string]$horizontalOffsetValue = $HORIZONTAL_OFFSET,  # % of width
         [string]$verticalOffsetValue   = $VERTICAL_OFFSET,    # % of height
         [string]$horizontalAlign       = $HORIZONTAL_ALIGN,
-        [string]$verticalAlign         = $VERTICAL_ALIGN
+        [string]$verticalAlign         = $VERTICAL_ALIGN,
+
+        # NEW: remove the input image (your raw temp copy) on success
+        [bool]$CleanupInput = $true
     )
 
     function Normalize-IMColor([string]$c) {
@@ -492,7 +578,6 @@ function Add-Overlay {
         }
         return $t
     }
-
     function To-Fraction([string]$v) {
         if ([string]::IsNullOrWhiteSpace($v)) { return 0.0 }
         $s = $v.Trim().Replace("%","")
@@ -501,105 +586,135 @@ function Add-Overlay {
         if ($n -le 1.0) { return $n } else { return $n/100.0 }
     }
 
-    # 1) Image size
-    $dims = & magick "$imagePath" -format "%w %h" info:
-    if ($LASTEXITCODE -ne 0 -or -not $dims) { throw "Could not read image dimensions." }
-    $imgW,$imgH = ($dims -split ' ') | ForEach-Object {[int]$_}
+    # Work dir for this render (prevents name collisions and eases cleanup)
+    $workDir = Join-Path $TEMP_IMAGE_PATH ("ovl_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
-    # 2) Percentages
-    $fontFrac   = To-Fraction $fontSizeValue
-    $padFrac    = To-Fraction $paddingValue
-    $radFrac    = To-Fraction $backRadiusValue
-    $offXFrac   = To-Fraction $horizontalOffsetValue
-    $offYFrac   = To-Fraction $verticalOffsetValue
+    try {
+        # 1) Read image dimensions
+        $dims = & magick "$imagePath" -format "%w %h" info:
+        if ($LASTEXITCODE -ne 0 -or -not $dims) { throw "Could not read image dimensions." }
+        $imgW,$imgH = ($dims -split ' ') | ForEach-Object {[int]$_}
 
-    # 3) Font sizing
-    $widthBudgetPct = 0.88
-    $minFontFrac    = 0.02
-    $maxFontFrac    = 0.10
+        # 2) Percentages → pixels
+        $fontFrac = To-Fraction $fontSizeValue
+        $padFrac  = To-Fraction $paddingValue
+        $radFrac  = To-Fraction $backRadiusValue
+        $offXFrac = To-Fraction $horizontalOffsetValue
+        $offYFrac = To-Fraction $verticalOffsetValue
 
-    $pointSize = [math]::Round($imgH * ([math]::Min($maxFontFrac,[math]::Max($minFontFrac,$fontFrac))))
-    $maxBoxW   = [math]::Floor($imgW * $widthBudgetPct)
+        # 3) Font sizing
+        $widthBudgetPct = 0.88
+        $minFontFrac    = 0.02
+        $maxFontFrac    = 0.10
+        $pointSize = [math]::Round($imgH * ([math]::Min($maxFontFrac,[math]::Max($minFontFrac,$fontFrac))))
+        $maxBoxW   = [math]::Floor($imgW * $widthBudgetPct)
 
-    # 4) Gravity (for anchor logic only)
-    $gX = switch (($horizontalAlign ?? "center").ToLower()) { 
-        "left" {"West"} "center" {"Center"} "right" {"East"} default {"Center"} 
-    }
-    $gY = switch (($verticalAlign ?? "bottom").ToLower()) { 
-        "top"  {"North"} "center" {"Center"} "bottom" {"South"} default {"South"} 
-    }
+        # 4) Gravity (for anchor logic only)
+        $gX = switch (($horizontalAlign ?? "center").ToLower()) { 
+            "left" {"West"} "center" {"Center"} "right" {"East"} default {"Center"} 
+        }
+        $gY = switch (($verticalAlign ?? "bottom").ToLower()) { 
+            "top"  {"North"} "center" {"Center"} "bottom" {"South"} default {"South"} 
+        }
 
-    # 5) Render label + shrink-to-fit
-    $tmpDir = $TEMP_IMAGE_PATH
-    $label  = Join-Path $tmpDir "label.png"
-    function RenderLabel([int]$pt) {
-        Remove-Item -Path $label -ErrorAction SilentlyContinue
-        & magick -background none -fill "$fontColor" -font "$fontPath" -pointsize $pt label:"$text" -alpha set "$label"
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $label)) { return $null }
-        $d = & magick "$label" -format "%w %h" info:
-        if (-not $d) { return $null }
-        $w,$h = ($d -split ' ') | ForEach-Object {[int]$_}
-        return @{W=$w;H=$h}
-    }
-
-    $m = RenderLabel $pointSize
-    if (-not $m) { throw "Initial label render failed." }
-    while ($m.W -gt $maxBoxW -and $pointSize -gt [math]::Round($imgH*$minFontFrac)) {
-        $pointSize = [math]::Max([math]::Round($imgH*$minFontFrac), $pointSize - [math]::Ceiling([math]::Max(1,$pointSize*0.08)))
+        # 5) Render label + shrink-to-fit
+        $label = Join-Path $workDir "label.png"
+        function RenderLabel([int]$pt) {
+            Remove-Item -Path $label -ErrorAction SilentlyContinue
+            & magick -background none -fill "$fontColor" -font "$fontPath" -pointsize $pt label:"$text" -alpha set "$label"
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $label)) { return $null }
+            $d = & magick "$label" -format "%w %h" info:
+            if (-not $d) { return $null }
+            $w,$h = ($d -split ' ') | ForEach-Object {[int]$_}
+            return @{W=$w;H=$h}
+        }
         $m = RenderLabel $pointSize
-        if (-not $m) { throw "Label render failed during shrink-to-fit." }
+        if (-not $m) { throw "Initial label render failed." }
+        while ($m.W -gt $maxBoxW -and $pointSize -gt [math]::Round($imgH*$minFontFrac)) {
+            $pointSize = [math]::Max([math]::Round($imgH*$minFontFrac), $pointSize - [math]::Ceiling([math]::Max(1,$pointSize*0.08)))
+            $m = RenderLabel $pointSize
+            if (-not $m) { throw "Label render failed during shrink-to-fit." }
+        }
+        $labelW,$labelH = [int]$m.W, [int]$m.H
+
+        # 6) Padding & radius
+        $padPx = [math]::Max(2, [math]::Round([math]::Max($imgH*$padFrac, $pointSize*0.45)))
+        $radPx = [math]::Round([math]::Max($imgH*$radFrac, $pointSize*0.35))
+        $targetW = $labelW + 2*$padPx
+        $targetH = $labelH + 2*$padPx
+        $effRad  = [math]::Min($radPx, [math]::Floor([math]::Min($targetW,$targetH)/2))
+
+        # 7) Background pill
+        $backColorNorm = Normalize-IMColor $backColor
+        $transparentBg = -not ($backColorNorm -and $backColorNorm.Trim().ToLower() -notin @("none","transparent"))
+
+        $labelWithBg = Join-Path $workDir "label_bg.png"
+        Remove-Item -Path $labelWithBg -ErrorAction SilentlyContinue
+        if ($transparentBg) {
+            & magick "$label" -alpha set -bordercolor none -border $padPx "$labelWithBg"
+        } else {
+            $bg   = Join-Path $workDir "bg.png"
+            $draw = "roundrectangle 0,0 $($targetW-1),$($targetH-1) $effRad,$effRad"
+            & magick -size "${targetW}x${targetH}" canvas:none -alpha set -fill "$backColorNorm" -draw "$draw" "$bg"
+            & magick "$bg" -alpha set "$label" -alpha set -gravity center -compose over -composite "$labelWithBg"
+            Remove-Item -Path $bg -ErrorAction SilentlyContinue
+        }
+
+        # 8) Shadow
+        $shadowed = Join-Path $workDir "label_shadow.png"
+        & magick "$labelWithBg" -alpha set "(" "+clone" "-alpha" "set" "-background" "black" "-shadow" "60x3+3+3" ")" `
+            "+swap" "-background" "none" "-layers" "merge" "+repage" -alpha set "$shadowed"
+
+        # 9) Compute anchor coordinates (NorthWest gravity always)
+        $anchorX = switch ($gX) {
+            "West"   { [math]::Round($imgW * $offXFrac) }
+            "Center" { [math]::Round(($imgW - $targetW) / 2) + [math]::Round($imgW * $offXFrac) }
+            "East"   { $imgW - $targetW - [math]::Round($imgW * $offXFrac) }
+        }
+        $anchorY = switch ($gY) {
+            "North"  { [math]::Round($imgH * $offYFrac) }
+            "Center" { [math]::Round(($imgH - $targetH) / 2) + [math]::Round($imgH * $offYFrac) }
+            "South"  { $imgH - $targetH - [math]::Round($imgH * $offYFrac) }
+        }
+
+        # 10) Composite to a DIFFERENT filename than the input
+        $inName = [IO.Path]::GetFileNameWithoutExtension($imagePath)
+        $inExt  = [IO.Path]::GetExtension($imagePath)
+        $outPath = Join-Path $TEMP_IMAGE_PATH "$inName.__overlay$inExt"
+
+        Remove-Item -Path $outPath -ErrorAction SilentlyContinue
+        & magick "$imagePath" "$shadowed" -gravity NorthWest -geometry +$anchorX+$anchorY -compose over -composite "$outPath"
+
+        # Validate output
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outPath)) {
+            throw "Overlay render failed (no output)."
+        }
+        if (-not (Validate-Poster -filePath $outPath)) {
+            throw "Overlay render failed (invalid image)."
+        }
+        if ((Get-Item $outPath).Length -lt 2048) {
+            throw "Overlay render failed (suspiciously small output)."
+        }
+
+        # NEW: optionally delete the INPUT (the raw temp copy without __overlay)
+        if ($CleanupInput -and (Test-Path -LiteralPath $imagePath)) {
+            try {
+                Remove-Item -LiteralPath $imagePath -Force -ErrorAction SilentlyContinue
+                Log-Message -Type "INF" -Message "Deleted temporary pre-overlay file: $imagePath"
+            } catch { }
+        }
+
+        return $outPath
     }
-
-    $labelW,$labelH = [int]$m.W, [int]$m.H
-
-    # 6) Padding & radius
-    $padPx = [math]::Max(2, [math]::Round([math]::Max($imgH*$padFrac, $pointSize*0.45)))
-    $radPx = [math]::Round([math]::Max($imgH*$radFrac, $pointSize*0.35))
-
-    $targetW = $labelW + 2*$padPx
-    $targetH = $labelH + 2*$padPx
-    $effRad  = [math]::Min($radPx, [math]::Floor([math]::Min($targetW,$targetH)/2))
-
-    # 7) Background pill
-    $backColorNorm = Normalize-IMColor $backColor
-    $transparentBg = -not ($backColorNorm -and $backColorNorm.Trim().ToLower() -notin @("none","transparent"))
-
-    $labelWithBg = Join-Path $tmpDir "label_bg.png"
-    Remove-Item -Path $labelWithBg -ErrorAction SilentlyContinue
-    if ($transparentBg) {
-        & magick "$label" -alpha set -bordercolor none -border $padPx "$labelWithBg"
-    } else {
-        $bg = Join-Path $tmpDir "bg.png"
-        $draw = "roundrectangle 0,0 $($targetW-1),$($targetH-1) $effRad,$effRad"
-        & magick -size "${targetW}x${targetH}" canvas:none -alpha set -fill "$backColorNorm" -draw "$draw" "$bg"
-        & magick "$bg" -alpha set "$label" -alpha set -gravity center -compose over -composite "$labelWithBg"
-        Remove-Item -Path $bg -ErrorAction SilentlyContinue
+    finally {
+        # Remove all scratch artifacts for this render
+        try {
+            if (Test-Path -LiteralPath $workDir) {
+                Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
     }
-
-    # 8) Shadow
-    $shadowed = Join-Path $tmpDir "label_shadow.png"
-    & magick "$labelWithBg" -alpha set "(" "+clone" "-alpha" "set" "-background" "black" "-shadow" "60x3+3+3" ")" `
-        "+swap" "-background" "none" "-layers" "merge" "+repage" -alpha set "$shadowed"
-
-    # 9) Compute anchor coordinates (NorthWest gravity always)
-    $anchorX = switch ($gX) {
-        "West"   { [math]::Round($imgW * $offXFrac) }
-        "Center" { [math]::Round(($imgW - $targetW) / 2) + [math]::Round($imgW * $offXFrac) }
-        "East"   { $imgW - $targetW - [math]::Round($imgW * $offXFrac) }
-    }
-    $anchorY = switch ($gY) {
-        "North"  { [math]::Round($imgH * $offYFrac) }
-        "Center" { [math]::Round(($imgH - $targetH) / 2) + [math]::Round($imgH * $offYFrac) }
-        "South"  { $imgH - $targetH - [math]::Round($imgH * $offYFrac) }
-    }
-
-    # 10) Composite (always with NorthWest gravity now)
-    $outPath = Join-Path -Path $TEMP_IMAGE_PATH -ChildPath ([IO.Path]::GetFileName($imagePath))
-    & magick "$imagePath" "$shadowed" -gravity NorthWest -geometry +$anchorX+$anchorY -compose over -composite "$outPath"
-
-    # Cleanup
-    Remove-Item -Path $label,$labelWithBg,$shadowed -ErrorAction SilentlyContinue
-    return $outPath
 }
 
 
@@ -610,8 +725,33 @@ function Upload-Poster {
         [Parameter(Mandatory=$true)][string]$metadataId
     )
 
-    $uploadUrl = "$PLEX_URL/library/metadata/$metadataId/posters"
-    $extension = [System.IO.Path]::GetExtension($posterPath).ToLower()
+    # Basic sanity checks
+    if (-not (Test-Path -LiteralPath $posterPath)) {
+        throw "Upload-Poster: file does not exist: $posterPath"
+    }
+    if (-not (Validate-Poster -filePath $posterPath)) {
+        throw "Upload-Poster: invalid image: $posterPath"
+    }
+    $size = (Get-Item -LiteralPath $posterPath).Length
+    if ($size -lt 2048) {
+        throw "Upload-Poster: output too small ($size bytes): $posterPath"
+    }
+
+    # Force JPEG uploads for maximum Plex/client compatibility
+    $FORCE_JPEG_UPLOAD = [bool]($env:FORCE_JPEG_UPLOAD -eq "true")
+
+    $pathToSend = $posterPath
+    $extension  = [System.IO.Path]::GetExtension($posterPath).ToLowerInvariant()
+
+    if ($FORCE_JPEG_UPLOAD -and $extension -notin @(".jpg",".jpeg")) {
+        $jpgPath = Join-Path ([System.IO.Path]::GetDirectoryName($posterPath)) (([System.IO.Path]::GetFileNameWithoutExtension($posterPath)) + ".__upload.jpg")
+        & magick "$posterPath" -quality 92 "$jpgPath"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $jpgPath) -or -not (Validate-Poster -filePath $jpgPath)) {
+            throw "Upload-Poster: failed to convert to jpg for upload."
+        }
+        $pathToSend = $jpgPath
+        $extension  = ".jpg"
+    }
 
     switch ($extension) {
         ".jpg"  { $contentType = "image/jpeg" }
@@ -621,21 +761,30 @@ function Upload-Poster {
         default { $contentType = "application/octet-stream" }
     }
 
-    $posterBytes = [System.IO.File]::ReadAllBytes($posterPath)
-
-    Log-Message -Type "DBG" -Message "POST $uploadUrl (token in header, Content-Type: $contentType)"
-    Invoke-RestMethod -Uri $uploadUrl `
-        -Method POST `
-        -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } `
-        -Body $posterBytes `
-        -ContentType $contentType `
-        -ErrorAction Stop
+    $uploadUrl = "$PLEX_URL/library/metadata/$metadataId/posters"
 
     try {
-        Remove-Item -Path $posterPath -ErrorAction Stop
-        Log-Message -Type "INF" -Message "Deleted temporary file: $posterPath"
+        $bytes = [System.IO.File]::ReadAllBytes($pathToSend)
+        Invoke-RestMethod -Uri $uploadUrl `
+            -Method POST `
+            -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } `
+            -Body $bytes `
+            -ContentType $contentType `
+            -ErrorAction Stop | Out-Null
+        Log-Message -Type "SUC" -Message "Uploaded poster for metadataId=$metadataId"
     } catch {
-        Log-Message -Type "WRN" -Message "Failed to delete temporary file ${posterPath}: $_"
+        Log-Message -Type "ERR" -Message "Failed to upload poster for metadataId=${metadataId}: $_"
+        throw
+    } finally {
+        # Clean up the rendered overlay and any converted upload copy
+        foreach ($p in (@($posterPath, $pathToSend) | Select-Object -Unique)) {
+            try {
+                if (Test-Path -LiteralPath $p) {
+                    Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+                    Log-Message -Type "INF" -Message "Deleted temporary file: $p"
+                }
+            } catch { }
+        }
     }
 }
 
@@ -756,281 +905,540 @@ function Janitor-Posters {
         } catch { return $false }
     }
 
-function Process-MediaItems {
-    $collectionsUrl = "$MAINTAINERR_URL/api/collections"
-    Log-Message -Type "DBG" -Message "Resolved collectionsUrl = '$collectionsUrl'"
+# Where Plex Metadata & DB are mounted in your container
+$PLEX_META_DIR = "/plexmeta"
 
-    try {
-        $maintainerrData = Invoke-RestMethod -Uri $collectionsUrl -Method Get
-        Log-Message -Type "INF" -Message "Fetched collection data from Maintainerr."
-    } catch {
-        Log-Message -Type "ERR" -Message "Failed to fetch Maintainerr data from $collectionsUrl. Error: $_"
+function Remove-LocalPosterById {
+    param(
+        [Parameter(Mandatory=$true)][string]$PosterId,
+        [string]$MetaRoot = $PLEX_META_DIR,
+        [switch]$WhatIf
+    )
+    if (-not (Test-Path $MetaRoot)) {
+        Log-Message -Type "WRN" -Message "Metadata root not found at $MetaRoot"
+        return 0
+    }
+
+    # Find exact filename matches (no extension), avoid anything under 'Contents'
+    $deleted = 0
+    # Using -Recurse + filtering in pipeline to guarantee exact name match
+    Get-ChildItem -Path $MetaRoot -Recurse -File -ErrorAction SilentlyContinue `
+    | Where-Object {
+        $_.Name -eq $PosterId -and $_.DirectoryName -notmatch '(?i)[/\\]Contents([/\\]|$)'
+    } | ForEach-Object {
+        if ($WhatIf) {
+            Log-Message -Type "INF" -Message "Would delete: $($_.FullName)"
+        } else {
+            try {
+                Remove-Item -LiteralPath $_.FullName -Force
+                $deleted++
+                Log-Message -Type "INF" -Message "Deleted: $($_.FullName)"
+            } catch {
+                Log-Message -Type "WRN" -Message "Failed to delete $($_.FullName): $_"
+            }
+        }
+    }
+    return $deleted
+}
+
+function Remove-OldUploadedPosterForItem {
+    param(
+        [Parameter(Mandatory=$true)][string]$OldUploadId,
+        [Parameter(Mandatory=$true)][array]$CurrentPhotosForItem,  # result of Get-PlexPosters -MetadataId <this item>
+        [string]$MetaRoot = $PLEX_META_DIR
+    )
+
+    if ([string]::IsNullOrWhiteSpace($OldUploadId)) { return }
+
+    # Find the Photo node for the old upload in THIS item’s poster list
+    $oldNode = $CurrentPhotosForItem | Where-Object {
+        $_.ratingKey -eq "upload://posters/$OldUploadId"
+    }
+
+    if (-not $oldNode) {
+        # Not present in the item’s posters list anymore → safe to delete locally
+        [void](Remove-LocalPosterById -PosterId $OldUploadId -MetaRoot $MetaRoot)
         return
     }
 
-    # Load current state and ensure keys are strings
-    $loadedState = Load-CollectionState
-    $currentState = @{}
-    foreach ($entry in $loadedState.GetEnumerator()) {
-        $currentState["$($entry.Key)"] = $entry.Value
-    }
+    # Normalize selected flag ("1"/"true" vs "0"/"false")
+    $sel = "$($oldNode.selected)".ToLower()
+    $isSelected = ($sel -eq "1" -or $sel -eq "true")
 
-    $newState = @{}
-
-    foreach ($collection in $maintainerrData) {
-        # Resolve target name (manual vs automatic)
-        $TargetCollectionName = Get-TargetCollectionName -Collection $collection
-        $IsManual = ($TargetCollectionName -ne $collection.title)
-        if ($IsManual) {
-            Log-Message -Type "INF" -Message "Detected custom (manual) collection. Using Plex collection name: '$TargetCollectionName' (from manualCollectionName)."
-        } else {
-            Log-Message -Type "DBG" -Message "Using Maintainerr title as Plex collection name: '$TargetCollectionName'."
-        }
-
-        Log-Message -Type "INF" -Message "Processing collection: $($collection.title)"
-        $deleteAfterDays   = $collection.deleteAfterDays
-        $LibrarySectionId  = $collection.libraryId
-        if (-not $LibrarySectionId) { $LibrarySectionId = "2" }
-        $CollectionName    = $TargetCollectionName
-
-        # Filter by configured list
-        if ("*" -notin $collectionsToReorder) {
-            $namesToCheck = @("$($collection.title)","$CollectionName") | Where-Object { $_ -and $_.Trim() } | Select-Object -Unique
-            $shouldProcess = $false
-            foreach ($n in $namesToCheck) {
-                if ($n -in $collectionsToReorder) { $shouldProcess = $true; break }
-            }
-            # AFTER:
-if (-not $shouldProcess) {
-    Log-Message -Type "INF" -Message "Skipping collection: '$($collection.title)' (target: '$CollectionName'). Carrying state forward."
-    foreach ($item in $collection.media) {
-        $plexId = "$($item.plexId)"
-        # If we have prior state, keep it - otherwise mark as untouched
-        $prior = $currentState["$plexId"]
-        if ($null -ne $prior) {
-            $newState["$plexId"] = $prior
-        } else {
-            
-            $newState["$plexId"] = @{ processed = $false; deleteDate = $null }
-        }
-    }
-    continue
-}
-        }
-
-       # Build sortable list
-$mediaList = @()
-foreach ($item in $collection.media) {
-    $plexId     = $item.plexId.ToString()
-    $deleteDate = $item.addDate.AddDays($deleteAfterDays)
-    $mediaList += [PSCustomObject]@{
-        PlexId     = $plexId
-        DeleteDate = $deleteDate
-        Item       = $item
+    if (-not $isSelected) {
+        # Present but NOT selected → safe to delete locally
+        [void](Remove-LocalPosterById -PosterId $OldUploadId -MetaRoot $MetaRoot)
+    } else {
+        # Still selected → do NOT delete
+        Log-Message -Type "INF" -Message "Old uploaded poster '$OldUploadId' is still selected; skipping local delete."
     }
 }
 
-# If Maintainerr reports nothing, carry state forward using actual Plex collection items
-if (-not $mediaList -or $mediaList.Count -eq 0) {
-    Log-Message -Type "INF" -Message "Collection '$CollectionName' has no items from Maintainerr. Carrying state forward from Plex and skipping."
-    $plexIdsInCollection = Get-PlexCollectionItemIds -MAINTAINERR_URL $MAINTAINERR_URL -PLEX_URL $PLEX_URL -PLEX_TOKEN $PLEX_TOKEN -LibrarySectionId $LibrarySectionId -CollectionName $CollectionName
-    foreach ($mid in $plexIdsInCollection) {
-        $prior = $currentState["$mid"]
-        if ($null -ne $prior) {
-            $newState["$mid"] = $prior
-        } else {
-            
-            $newState["$mid"] = @{ processed = $false; deleteDate = $null }
+function Process-MediaItems {
+
+        function Get-PlexPosters {
+            param([Parameter(Mandatory=$true)][string]$MetadataId)
+            $url = "$PLEX_URL/library/metadata/$MetadataId/posters"
+            try {
+                $resp = Invoke-RestMethod -Uri $url -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } -Method GET -ErrorAction Stop
+            } catch {
+                Log-Message -Type "WRN" -Message "Failed to list posters for ${MetadataId}: $_"
+                return @()
+            }
+            $mc = $resp.MediaContainer
+            if (-not $mc) { return @() }
+            $photos = @()
+            if ($mc.Photo) { $photos += $mc.Photo }
+            return @($photos)
         }
-    }
-    continue
-}
 
-        $sortedMedia = $mediaList | Sort-Object -Property DeleteDate
+        function Get-UploadPosterIds {
+            param([Parameter(Mandatory=$true)][array]$Photos)
+            $ids = New-Object System.Collections.Generic.List[string]
+            foreach ($p in $Photos) {
+                $rk = if ($p.ratingKey) { "$($p.ratingKey)" } elseif ($p.key) { "$($p.key)" } else { "" }
+                if (-not [string]::IsNullOrWhiteSpace($rk) -and $rk.StartsWith("upload://posters/")) {
+                    $ids.Add($rk.Substring("upload://posters/".Length))
+                }
+            }
+            return @($ids | Select-Object -Unique)
+        }
 
-        foreach ($media in $sortedMedia) {
-            $item   = $media.Item
-            $plexId = $media.PlexId
+        function Remove-PlexUploadedPoster {
+            param(
+                [Parameter(Mandatory=$true)][string]$MetadataId,
+                [Parameter(Mandatory=$true)][string]$UploadPosterId
+            )
+            $delUrl = "$PLEX_URL/library/metadata/$MetadataId/posters?url=$( [uri]::EscapeDataString("upload://posters/$UploadPosterId") )"
+            try {
+                Invoke-RestMethod -Uri $delUrl -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } -Method DELETE -ErrorAction Stop | Out-Null
+                Log-Message -Type "INF" -Message "Removed previous uploaded poster $UploadPosterId for $MetadataId"
+                return $true
+            } catch {
+                Log-Message -Type "WRN" -Message "Failed to remove uploaded poster $UploadPosterId for $MetadataId. Error: $_"
+                return $false
+            }
+        }
 
-            # New deletion date
-            $deleteDateUtc    = ($media.DeleteDate).ToUniversalTime()
-            $newDeleteDateIso = $deleteDateUtc.ToString("o")
+        # --- Per-collection order env lists -----------------------------------------
+        function Split-List([string]$s) {
+            if ([string]::IsNullOrWhiteSpace($s)) { return @() }
+            return @(
+                $s -split "," |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ -ne "" } |
+                Select-Object -Unique
+            )
+        }
+        
 
-            # Read prior state 
-            $prior = $currentState["$plexId"]
-            $priorProcessed = $false
-            $priorDeleteDateIso = $null
+        # Accept both COLLECTIONS_DESC and COLLECTION_DESC (either works)
+        $env_COLLECTION_ASC   = $env:COLLECTION_ASC
+        $env_COLLECTION_DESC = $env:COLLECTION_DESC 
 
-            if     ($prior -is [bool])          { $priorProcessed = $prior }
-            elseif ($prior -is [string])        { $priorProcessed = ($prior -eq "true") }
-            elseif ($prior -is [pscustomobject] -or $prior -is [hashtable]) {
-                $priorProcessed     = (("$($prior.processed)") -eq "True")
-                $priorDeleteDateIso = "$($prior.deleteDate)"
+        # Build case-insensitive hashsets for fast membership checks
+        $script:AscSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $script:DescSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+        foreach ($n in (Split-List $env_COLLECTION_ASC))   { [void]$script:AscSet.Add($n) }
+        foreach ($n in (Split-List $env_COLLECTION_DESC)) { [void]$script:DescSet.Add($n) }
+
+        function Get-CollectionOrderOverride {
+            param([Parameter(Mandatory)][string]$CollectionName)
+            $inAsc  = $script:AscSet.Contains($CollectionName)
+            $inDesc = $script:DescSet.Contains($CollectionName)
+
+            if ($inAsc -and $inDesc) {
+                Log-Message -Type "WRN" -Message "Collection '$CollectionName' found in both COLLECTION_ASC and COLLECTIONS_DESC. Using DESC."
+                return "asc"
+            }
+            if ($inAsc)  { return "asc"  }
+            if ($inDesc) { return "desc" }
+            return $null  # means: use old/global logic
+        }
+
+        function Purge-ItemUploadedOverlays {
+            param(
+                [Parameter(Mandatory=$true)][string]$MetadataId,
+                [Parameter()][object]$PriorState
+            )
+            try {
+                # Prefer the recorded uploadedPosterId from state; fall back to live scan
+                $priorUploadedId = $null
+                if ($PriorState -is [pscustomobject] -or $PriorState -is [hashtable]) {
+                    $priorUploadedId = "$($PriorState.uploadedPosterId)"
+                }
+
+                $idsToRemove = New-Object System.Collections.Generic.List[string]
+                if (-not [string]::IsNullOrWhiteSpace($priorUploadedId)) {
+                    $idsToRemove.Add($priorUploadedId) | Out-Null
+                } else {
+                    # Enumerate current uploaded posters; we only use ids to remove local files
+                    $photos    = Get-PlexPosters -MetadataId $MetadataId
+                    $uploadIds = Get-UploadPosterIds -Photos $photos
+                    foreach ($i in $uploadIds) { if ($i) { $idsToRemove.Add($i) | Out-Null } }
+                }
+
+                foreach ($oldId in ($idsToRemove | Select-Object -Unique)) {
+                    if ([string]::IsNullOrWhiteSpace($oldId)) { continue }
+                    # Delete the physical uploaded file from the Plex metadata tree (no API call)
+                    [void](Remove-LocalPosterById -PosterId $oldId)
+                }
+
+                if ($idsToRemove.Count -gt 0) {
+                    Log-Message -Type "INF" -Message "Purged (local) uploaded overlay file(s) for ${MetadataId}: $($idsToRemove -join ', ')"
+                } else {
+                    Log-Message -Type "INF" -Message "No uploaded overlay files found to purge locally for $MetadataId."
+                }
+            } catch {
+                Log-Message -Type "WRN" -Message "Failed local purge of uploaded overlay file(s) for ${MetadataId}: $_"
+            }
+        }
+
+        # -------------------------------------------------------------------------
+
+        $collectionsUrl = "$MAINTAINERR_URL/api/collections"
+
+        try {
+            $maintainerrData = Invoke-RestMethod -Uri $collectionsUrl -Method Get
+            Log-Message -Type "INF" -Message "Fetched collection data from Maintainerr."
+        } catch {
+            Log-Message -Type "ERR" -Message "Failed to fetch Maintainerr data from $collectionsUrl. Error: $_"
+            return
+        }
+
+        # Load current state and ensure keys are strings
+        $loadedState = Load-CollectionState
+        $currentState = @{}
+        foreach ($entry in $loadedState.GetEnumerator()) {
+            $currentState["$($entry.Key)"] = $entry.Value
+        }
+
+        $newState = @{}
+
+        # Gather ACTUAL Plex membership across all processed collections
+        $script:AllPlexCollectionIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+
+        foreach ($collection in $maintainerrData) {
+            # Resolve target name (manual vs automatic)
+            $TargetCollectionName = Get-TargetCollectionName -Collection $collection
+            $IsManual = ($TargetCollectionName -ne $collection.title)
+            if ($IsManual) {
+                Log-Message -Type "INF" -Message "Detected custom (manual) collection. Using Plex collection name: '$TargetCollectionName' (from manualCollectionName)."
+            } else {
+                Log-Message -Type "DBG" -Message "Using Maintainerr title as Plex collection name: '$TargetCollectionName'."
             }
 
-            # Compare on date-only
-            function To-DateOnlyIso([datetime]$dt) { return $dt.ToUniversalTime().ToString("yyyy-MM-dd") }
+            Log-Message -Type "INF" -Message "Processing collection: $($collection.title)"
+            $deleteAfterDays   = $collection.deleteAfterDays
+            $LibrarySectionId  = $collection.libraryId
+            if (-not $LibrarySectionId) { $LibrarySectionId = "2" }
+            $CollectionName    = $TargetCollectionName
 
-            $priorDateOnly = $null
-            if ($priorDeleteDateIso) {
-                try { $priorDateOnly = (Get-Date $priorDeleteDateIso).ToUniversalTime().ToString("yyyy-MM-dd") } catch { $priorDateOnly = $priorDeleteDateIso }
-            }
-            $newDateOnly = To-DateOnlyIso $media.DeleteDate
-
-            $needsReoverlayDueToDateChange = $false
-            if ($priorProcessed -and $priorDateOnly) {
-                if ($priorDateOnly -ne $newDateOnly) {
-                    $needsReoverlayDueToDateChange = $true
-                    Log-Message -Type "INF" -Message "Delete date changed for $plexId. Old=$priorDateOnly New=$newDateOnly → will rebuild overlay."
+            # Filter by configured list
+            if ("*" -notin $collectionsToReorder) {
+                $namesToCheck = @("$($collection.title)","$CollectionName") | Where-Object { $_ -and $_.Trim() } | Select-Object -Unique
+                $shouldProcess = $false
+                foreach ($n in $namesToCheck) {
+                    if ($n -in $collectionsToReorder) { $shouldProcess = $true; break }
+                }
+                if (-not $shouldProcess) {
+                    Log-Message -Type "INF" -Message "Skipping collection: '$($collection.title)' (target: '$CollectionName'). Carrying state forward."
+                    foreach ($item in $collection.media) {
+                        $plexId = "$($item.plexId)"
+                        $prior = $currentState["$plexId"]
+                        if ($null -ne $prior) {
+                            $newState["$plexId"] = $prior
+                        } else {
+                            $newState["$plexId"] = @{ processed = $false; deleteDate = $null }
+                        }
+                    }
+                    continue
                 }
             }
 
-            # Case 1: Already processed, date unchanged, and reapply disabled - skip (carry state forward)
-            if (-not $needsReoverlayDueToDateChange -and -not $REAPPLY_OVERLAY -and $priorProcessed) {
-                Log-Message -Type "INF" -Message "Skipping Plex ID: $plexId (already processed; date unchanged)."
-                $newState["$plexId"] = @{
-                    processed  = $true
-                    deleteDate = $deleteDateUtc.ToString("o")
+            # Build sortable list
+            $mediaList = @()
+            foreach ($item in $collection.media) {
+                $plexId     = $item.plexId.ToString()
+                $deleteDate = $item.addDate.AddDays($deleteAfterDays)
+                $mediaList += [PSCustomObject]@{
+                    PlexId     = $plexId
+                    DeleteDate = $deleteDate
+                    Item       = $item
+                }
+            }
+
+            # Capture ACTUAL Plex membership for this collection
+            $plexCollectionIds = Get-PlexCollectionItemIds -MAINTAINERR_URL $MAINTAINERR_URL `
+                -PLEX_URL $PLEX_URL -PLEX_TOKEN $PLEX_TOKEN `
+                -LibrarySectionId $LibrarySectionId -CollectionName $CollectionName
+
+            foreach ($id in $plexCollectionIds) { [void]$script:AllPlexCollectionIds.Add("$id") }
+
+            # If Maintainerr reports nothing, carry state forward using actual Plex collection items
+            if (-not $mediaList -or $mediaList.Count -eq 0) {
+                Log-Message -Type "INF" -Message "Collection '$CollectionName' has no items from Maintainerr. Carrying state forward from Plex and skipping."
+                foreach ($mid in $plexCollectionIds) {
+                    $mid = "$mid"
+                    $prior = $currentState[$mid]
+                    if ($null -ne $prior) {
+                        $newState[$mid] = $prior
+                    } else {
+                        $newState[$mid] = @{ processed = $false; deleteDate = $null }
+                    }
                 }
                 continue
             }
 
-            # Otherwise:
-            #  date changed - ALWAYS rebuild (even if REAPPLY_OVERLAY=false) or REAPPLY_OVERLAY=true - rebuild
-            try {
-                # Always base overlay on the ORIGINAL file if available else download ONCE and keep.
-                $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse -ErrorAction SilentlyContinue
-                if ($posterFiles -and $posterFiles.Count -gt 0) {
-                    $originalImagePath = $posterFiles[0].FullName
-                    Log-Message -Type "INF" -Message "Using saved original for $plexId ($([IO.Path]::GetExtension($originalImagePath)))"
-                } else {
-                    $posterUrl = Get-BestPlexImageUrl -MetadataId $plexId
-                    if (-not $posterUrl) {
-                        Log-Message -Type "WRN" -Message "No usable image found for Plex ID: $plexId (server=$PLEX_URL). Skipping."
-                        $newState["$plexId"] = @{
-                            processed  = $false
-                            deleteDate = $newDeleteDateIso
-                        }
-                        continue
+            $sortedMedia = $mediaList | Sort-Object -Property DeleteDate
+
+            foreach ($media in $sortedMedia) {
+                $item   = $media.Item
+                $plexId = $media.PlexId
+
+                # New deletion date
+                $deleteDateUtc    = ($media.DeleteDate).ToUniversalTime()
+                $newDeleteDateIso = $deleteDateUtc.ToString("o")
+
+                # Read prior state 
+                $prior = $currentState["$plexId"]
+                $priorProcessed = $false
+                $priorDeleteDateIso = $null
+                $priorUploadedPosterId = $null
+                $priorDaysLeftShown    = $null
+
+                if     ($prior -is [bool])          { $priorProcessed = $prior }
+                elseif ($prior -is [string])        { $priorProcessed = ($prior -eq "true") }
+                elseif ($prior -is [pscustomobject] -or $prior -is [hashtable]) {
+                    $priorProcessed         = (("$($prior.processed)") -eq "True")
+                    $priorDeleteDateIso     = "$($prior.deleteDate)"
+                    $priorUploadedPosterId  = "$($prior.uploadedPosterId)"
+                    $priorDaysLeftShown     = if ($prior.PSObject.Properties.Match("daysLeftShown")) { [int]$prior.daysLeftShown } else { $null }
+                }
+
+                # Compare on date-only
+                function To-DateOnlyIso([datetime]$dt) { return $dt.ToUniversalTime().ToString("yyyy-MM-dd") }
+                $priorDateOnly = $null
+                if ($priorDeleteDateIso) {
+                    try { $priorDateOnly = (Get-Date $priorDeleteDateIso).ToUniversalTime().ToString("yyyy-MM-dd") } catch { $priorDateOnly = $priorDeleteDateIso }
+                }
+                $newDateOnly = To-DateOnlyIso $media.DeleteDate
+
+                $needsReoverlayDueToDateChange = $false
+                if ($priorProcessed -and $priorDateOnly) {
+                    if ($priorDateOnly -ne $newDateOnly) {
+                        $needsReoverlayDueToDateChange = $true
+                        Log-Message -Type "INF" -Message "Delete date changed for $plexId. Old=$priorDateOnly New=$newDateOnly → will rebuild overlay."
                     }
-                    Log-Message -Type "WRN" -Message "Original poster not found for $plexId. Downloading once and saving as original..."
-                    $originalImagePath = Download-Poster -posterUrl $posterUrl -savePathBase ("$ORIGINAL_IMAGE_PATH/$plexId")
                 }
 
-                # Build overlay from ORIGINAL - TEMP - upload
-                $ext = [System.IO.Path]::GetExtension($originalImagePath)
-                $tempImagePath = Join-Path $TEMP_IMAGE_PATH "$plexId$ext"
-                Copy-Item -Path $originalImagePath -Destination $tempImagePath -Force
-
-                $formattedDate = Calculate-Date -addDate $item.addDate -deleteAfterDays $deleteAfterDays
-                Log-Message -Type "INF" -Message "Item $plexId formatted date: $formattedDate"
-
-                $tempImagePath = Add-Overlay -imagePath $tempImagePath -text "$OVERLAY_TEXT $formattedDate"
-                Upload-Poster -posterPath $tempImagePath -metadataId $plexId
-
-                # Save new state (object with deleteDate)
-                $newState["$plexId"] = @{
-                    processed  = $true
-                    deleteDate = $newDeleteDateIso
+                # If using days-left overlays, force rebuild when the *number of days* changes
+                $calc = Get-DaysLeft -addDate $item.addDate -deleteAfterDays $deleteAfterDays
+                $currentDaysLeft = [int]$calc.DaysLeft
+                if ($USE_DAYS -and $priorProcessed) {
+                    if ($priorDaysLeftShown -ne $currentDaysLeft) {
+                        $needsReoverlayDueToDateChange = $true
+                        Log-Message -Type "INF" -Message "Days-left changed for $plexId. Old=$priorDaysLeftShown New=$currentDaysLeft → will rebuild overlay."
+                    }
                 }
-                Log-Message -Type "INF" -Message "Updated state for ${plexId}: processed=true, deleteDate=$newDeleteDateIso"
-            } catch {
-                Log-Message -Type "WRN" -Message "Failed to process Plex ID: $plexId. Error: $_"
+
+                # Case 1: Already processed, date unchanged, and reapply disabled - skip (carry state forward)
+                if (-not $needsReoverlayDueToDateChange -and -not $REAPPLY_OVERLAY -and $priorProcessed) {
+                    Log-Message -Type "INF" -Message "Skipping Plex ID: $plexId (already processed; date unchanged)."
+                    $newState["$plexId"] = @{
+                        processed        = $true
+                        deleteDate       = $deleteDateUtc.ToString("o")
+                        uploadedPosterId = $priorUploadedPosterId
+                        daysLeftShown    = $(if ($USE_DAYS) { $currentDaysLeft } else { $priorDaysLeftShown })
+                    }
+                    continue
+                }
+
+                try {
+                    # Always base overlay on the ORIGINAL file if available else download ONCE and keep.
+                    $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse -ErrorAction SilentlyContinue
+                    if ($posterFiles -and $posterFiles.Count -gt 0) {
+                        $originalImagePath = $posterFiles[0].FullName
+                        Log-Message -Type "INF" -Message "Using saved original for $plexId ($([IO.Path]::GetExtension($originalImagePath)))"
+                    } else {
+                        $posterUrl = Get-BestPlexImageUrl -MetadataId $plexId
+                        if (-not $posterUrl) {
+                            Log-Message -Type "WRN" -Message "No usable image found for Plex ID: $plexId (server=$PLEX_URL). Skipping."
+                            $newState["$plexId"] = @{
+                                processed        = $false
+                                deleteDate       = $newDeleteDateIso
+                                uploadedPosterId = $priorUploadedPosterId
+                                daysLeftShown    = $(if ($USE_DAYS) { $currentDaysLeft } else { $null })
+                            }
+                            continue
+                        }
+                        Log-Message -Type "WRN" -Message "Original poster not found for $plexId. Downloading once and saving as original..."
+                        $originalImagePath = Download-Poster -posterUrl $posterUrl -savePathBase ("$ORIGINAL_IMAGE_PATH/$plexId")
+                    }
+
+                    $prePhotos    = Get-PlexPosters -MetadataId $plexId
+                    $preUploadIds = Get-UploadPosterIds -Photos $prePhotos
+
+                    # Build overlay from ORIGINAL - TEMP - upload
+                    $ext = [System.IO.Path]::GetExtension($originalImagePath)
+                    $tempImagePath = Join-Path $TEMP_IMAGE_PATH "$plexId$ext"
+                    Copy-Item -Path $originalImagePath -Destination $tempImagePath -Force
+
+                    # Build the overlay text based on mode
+                    if ($USE_DAYS) {
+                        # Fully-custom strings from env (TEXT_TODAY / TEXT_DAY / TEXT_DAYS)
+                        $labelText = Format-LeavingText -daysLeft $currentDaysLeft
+                    } else {
+                        # Classic date mode uses OVERLAY_TEXT + formatted date internally
+                        $labelText = Format-LeavingText -daysLeft $currentDaysLeft -addDate $item.addDate -deleteAfterDays $deleteAfterDays
+                    }
+
+                    $tempImagePath = Add-Overlay -imagePath $tempImagePath -text $labelText
+                    Upload-Poster -posterPath $tempImagePath -metadataId $plexId
+
+                    
+                    # --- POST: snapshot again and diff
+$postPhotos    = Get-PlexPosters -MetadataId $plexId
+$postUploadIds = Get-UploadPosterIds -Photos $postPhotos
+
+$newIds = @($postUploadIds | Where-Object { $_ -notin $preUploadIds })
+if ($newIds.Count -gt 0) {
+    $newUploadId = $newIds[0]
+
+    # Prefer item-scoped selection truth over DB snapshot (handles eventual consistency)
+    if ($priorUploadedPosterId -and $priorUploadedPosterId -ne $newUploadId) {
+        Remove-OldUploadedPosterForItem -OldUploadId $priorUploadedPosterId -CurrentPhotosForItem $postPhotos
+    }
+
+    # FORCE-SELECT THE NEWLY UPLOADED POSTER
+    $null = Select-UploadedPoster -MetadataId $plexId -UploadPosterId $newUploadId
+
+    $newState["$plexId"] = @{
+        processed        = $true
+        deleteDate       = $newDeleteDateIso
+        uploadedPosterId = $newUploadId
+        daysLeftShown    = $(if ($USE_DAYS) { $currentDaysLeft } else { $null })
+    }
+    Log-Message -Type "INF" -Message "Updated state for ${plexId}: processed=true, deleteDate=$newDeleteDateIso, uploadedPosterId=$newUploadId"
+} else {
+    $newState["$plexId"] = @{
+        processed        = $true
+        deleteDate       = $newDeleteDateIso
+        uploadedPosterId = $priorUploadedPosterId
+        daysLeftShown    = $(if ($USE_DAYS) { $currentDaysLeft } else { $null })
+    }
+    Log-Message -Type "WRN" -Message "No new upload id detected for $plexId; keeping uploadedPosterId='$priorUploadedPosterId'"
+}
+
+
+                } catch {
+                    Log-Message -Type "WRN" -Message "Failed to process Plex ID: $plexId. Error: $_"
+                }
+            }
+
+            # --- Reorder collection -----------------------------------
+            $sortedPlexIds = @($sortedMedia | ForEach-Object { $_.PlexId })  # force array
+            if (-not $sortedPlexIds -or $sortedPlexIds.Count -eq 0) {
+                Log-Message -Type "INF" -Message "Skipping reorder for '$CollectionName' (Maintainerr reports no items)."
+                continue
+            }
+            if ($sortedPlexIds.Count -eq 1) {
+                Log-Message -Type "INF" -Message "Skipping reorder for '$CollectionName' (only one item)."
+                continue
+            }
+
+            # Ensure memberships match before reordering
+            $maintSet = @($sortedPlexIds | Sort-Object -Unique)
+            $plexSet  = @($plexCollectionIds | Sort-Object -Unique)
+            $maintOnly = Compare-Object -ReferenceObject $maintSet -DifferenceObject $plexSet -PassThru | Where-Object { $_ -in $maintSet }
+            $plexOnly  = Compare-Object -ReferenceObject $plexSet  -DifferenceObject $maintSet -PassThru | Where-Object { $_ -in $plexSet  }
+            if ($maintOnly.Count -gt 0 -or $plexOnly.Count -gt 0) {
+                Log-Message -Type "WRN" -Message ("Collection membership mismatch for '$CollectionName'. " +
+                    "Maintainerr-only: [{0}] | Plex-only: [{1}]" -f ($maintOnly -join ','), ($plexOnly -join ','))
+                Log-Message -Type "INF" -Message "Skipping reorder until memberships match."
+                continue
+            }
+            Set-PlexCollectionOrder `
+                -MAINTAINERR_URL $MAINTAINERR_URL `
+                -PLEX_URL $PLEX_URL `
+                -PLEX_TOKEN $PLEX_TOKEN `
+                -LibrarySectionId $LibrarySectionId `
+                -CollectionName $CollectionName `
+                -SortedPlexIds $sortedPlexIds
+            # ----------------------------------------------------------------------
+        }
+
+        # --- Robust removals: confirm with ACTUAL Plex membership -----------------
+        $currentKeys = @($currentState.Keys | ForEach-Object { "$_" })
+
+        foreach ($plexId in $currentKeys) {
+            $inNewState        = $newState.ContainsKey("$plexId")
+            $inPlexCollections = $script:AllPlexCollectionIds.Contains("$plexId")
+
+            if (-not $inNewState -and -not $inPlexCollections) {
+                Log-Message -Type "INF" -Message "Item $plexId confirmed removed (not in newState AND not in Plex collections)."
+
+                # Find saved original (if any)
+                $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse -ErrorAction SilentlyContinue
+                $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { $null }
+
+                if (-not $originalImagePath -or -not (Test-Path -Path $originalImagePath)) {
+                    Log-Message -Type "WRN" -Message "Original poster not found for Plex ID: $plexId. Purging any leftover uploaded overlays and skipping revert."
+                    # Even if original is missing, still try to purge uploaded overlays from Plex & disk
+                    Purge-ItemUploadedOverlays -MetadataId $plexId -PriorState $currentState["$plexId"]
+                    continue
+                }
+
+                # If the item no longer exists at all in Plex, just delete saved original and any lingering uploaded overlays
+                if (-not (Test-PlexItemExistsLocal -PlexId $plexId)) {
+                    Log-Message -Type "INF" -Message "Plex ID: $plexId no longer exists in Plex. Purging overlays and deleting saved original."
+                    Purge-ItemUploadedOverlays -MetadataId $plexId -PriorState $currentState["$plexId"]
+                    Remove-Item -Path $originalImagePath -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+
+                # Purge uploaded overlays FIRST (Plex poster entry + local metadata file), then revert
+                Purge-ItemUploadedOverlays -MetadataId $plexId -PriorState $currentState["$plexId"]
+
+                Log-Message -Type "INF" -Message "Reverting Plex ID: $plexId to original poster."
+                $ok = Revert-ToOriginalPoster -plexId $plexId -originalImagePath $originalImagePath
+                if ($ok) {
+                    Remove-Item -Path $originalImagePath -Force -ErrorAction SilentlyContinue
+                    Log-Message -Type "INF" -Message "Deleted original poster after revert for Plex ID $plexId."
+                }
+                continue
+            }
+            elseif (-not $inNewState -and $inPlexCollections) {
+                # Maintainerr didn't return media item; item is still in Plex collection—carry forward state
+                Log-Message -Type "WRN" -Message "Item $plexId absent from Maintainerr this run, but present in Plex collection — skipping revert and carrying state."
+                $prior = $currentState["$plexId"]
+                if ($null -ne $prior) {
+                    $newState["$plexId"] = $prior
+                } else {
+                    $newState["$plexId"] = @{ processed = $false; deleteDate = $null }
+                }
+                continue
+            }
+            else {
+                Log-Message -Type "INF" -Message "Item $plexId is still in the collection."
             }
         }
 
-        
+        # Janitorial cleanup — use ACTUAL Plex membership
+        $plexGUIDs        = @($script:AllPlexCollectionIds)
+        $maintainerrGUIDs = $newState.Keys
+        Janitor-Posters -mediaList $plexGUIDs -maintainerrGUIDs $maintainerrGUIDs -newState $newState -originalImagePath $ORIGINAL_IMAGE_PATH -collectionName "All Media"
 
-       # Sort collection in Plex (candidate order from Maintainerr)
-$sortedPlexIds = @($sortedMedia | ForEach-Object { $_.PlexId })  # force array
-
-# Quick skips
-if (-not $sortedPlexIds -or $sortedPlexIds.Count -eq 0) {
-    Log-Message -Type "INF" -Message "Skipping reorder for '$CollectionName' (Maintainerr reports no items)."
-    continue
-}
-if ($sortedPlexIds.Count -eq 1) {
-    Log-Message -Type "INF" -Message "Skipping reorder for '$CollectionName' (only one item)."
-    continue
-}
-
-# Fetch actual Plex collection items
-$plexCollectionIds = Get-PlexCollectionItemIds -MAINTAINERR_URL $MAINTAINERR_URL -PLEX_URL $PLEX_URL -PLEX_TOKEN $PLEX_TOKEN -LibrarySectionId $LibrarySectionId -CollectionName $CollectionName
-
-if (-not $plexCollectionIds -or $plexCollectionIds.Count -eq 0) {
-    Log-Message -Type "INF" -Message "Skipping reorder for '$CollectionName' (Plex collection is empty)."
-    continue
-}
-
-# Compare sets
-$maintSet = @($sortedPlexIds | Sort-Object -Unique)
-$plexSet  = @($plexCollectionIds | Sort-Object -Unique)
-
-$maintOnly = Compare-Object -ReferenceObject $maintSet -DifferenceObject $plexSet -PassThru | Where-Object { $_ -in $maintSet }
-$plexOnly  = Compare-Object -ReferenceObject $plexSet  -DifferenceObject $maintSet -PassThru | Where-Object { $_ -in $plexSet  }
-
-if ($maintOnly.Count -gt 0 -or $plexOnly.Count -gt 0) {
-    Log-Message -Type "WRN" -Message ("Collection membership mismatch for '$CollectionName'. " +
-        "Maintainerr-only: [{0}] | Plex-only: [{1}]" -f ($maintOnly -join ','), ($plexOnly -join ','))
-    Log-Message -Type "INF" -Message "Skipping reorder until memberships match."
-    continue
-}
-
-Set-PlexCollectionOrder `
-    -MAINTAINERR_URL $MAINTAINERR_URL `
-    -PLEX_URL $PLEX_URL `
-    -PLEX_TOKEN $PLEX_TOKEN `
-    -LibrarySectionId $LibrarySectionId `
-    -CollectionName $CollectionName `
-    -SortedPlexIds $sortedPlexIds
+        # Save updated state (string keys)
+        $tempState = @{}
+        foreach ($key in $newState.Keys) {
+            $tempState["$key"] = $newState[$key]
+        }
+        Log-Message -Type "INF" -Message "Saving State: $(ConvertTo-Json $tempState -Depth 10)"
+        Save-CollectionState -state $newState
     }
 
-    # Handle removals (restore and delete)
-foreach ($plexId in $currentState.Keys) {
-    if (-not $newState.ContainsKey($plexId)) {
-        Log-Message -Type "INF" -Message "Item $plexId detected as removed (not in newState)."
-
-        $posterFiles = Get-ChildItem -Path $ORIGINAL_IMAGE_PATH -Include "$plexId.*" -Recurse -ErrorAction SilentlyContinue
-        $originalImagePath = if ($posterFiles) { $posterFiles[0].FullName } else { $null }
-
-        if (-not $originalImagePath -or -not (Test-Path -Path $originalImagePath)) {
-            Log-Message -Type "WRN" -Message "Original poster not found for Plex ID: $plexId. Skipping revert."
-            continue
-        }
-
-        if (-not (Test-PlexItemExistsLocal -PlexId $plexId)) {
-            # Media no longer exists in Plex - just delete the saved original
-            Log-Message -Type "INF" -Message "Plex ID: $plexId no longer exists in Plex. Deleting saved original."
-            Remove-Item -Path $originalImagePath -Force -ErrorAction SilentlyContinue
-            continue
-        }
-
-        # Still exists → revert and then delete the saved original
-        Log-Message -Type "INF" -Message "Reverting Plex ID: $plexId to original poster."
-        $ok = Revert-ToOriginalPoster -plexId $plexId -originalImagePath $originalImagePath
-        if ($ok) {
-            Remove-Item -Path $originalImagePath -Force -ErrorAction SilentlyContinue
-            Log-Message -Type "INF" -Message "Deleted original poster after revert for Plex ID $plexId."
-        }
-        continue
-    } else {
-        Log-Message -Type "INF" -Message "Item $plexId is still in the collection."
-    }
-}
-
-    # Janitorial cleanup
-    $plexGUIDs        = $currentState.Keys
-    $maintainerrGUIDs = $newState.Keys
-    Janitor-Posters -mediaList $plexGUIDs -maintainerrGUIDs $maintainerrGUIDs -newState $newState -originalImagePath $ORIGINAL_IMAGE_PATH -collectionName "All Media"
-
-    # Save updated state (string keys)
-    $tempState = @{}
-    foreach ($key in $newState.Keys) {
-        $tempState["$key"] = $newState[$key]
-    }
-    Log-Message -Type "INF" -Message "Saving State: $(ConvertTo-Json $tempState -Depth 10)"
-    Save-CollectionState -state $newState
-}
 
 
 if (-not (Test-Path -Path $IMAGE_SAVE_PATH)) {
@@ -1053,19 +1461,27 @@ function Set-PlexCollectionOrder {
         [Parameter(Mandatory=$true)][array]$SortedPlexIds
     )
 
-    # Determine order (asc/desc) from env var
-    $order = $env:PLEX_COLLECTION_ORDER
-    if (-not $order) { $order = "asc" }
-    $order = $order.ToLower()
+        # Determine order for THIS collection
+    $order = Get-CollectionOrderOverride -CollectionName $CollectionName
+
+    if (-not $order) {
+        # Fall back to old/global logic
+        $order = $env:PLEX_COLLECTION_ORDER
+        if (-not $order) { $order = "asc" }
+        $order = $order.ToLower()
+        Log-Message -Type "INF" -Message "Using global order '$order' for collection '$CollectionName'."
+    } else {
+        Log-Message -Type "INF" -Message "Using per-collection order '$order' for collection '$CollectionName'."
+    }
 
     switch ($order) {
         "asc"  { $finalOrder = $SortedPlexIds }
-        "desc" { 
+        "desc" {
             $finalOrder = $SortedPlexIds.Clone()
             [Array]::Reverse($finalOrder)
         }
         default {
-            Log-Message -Type "WRN" -Message "Unknown order '$order', defaulting to ascending."
+            Log-Message -Type "WRN" -Message "Unknown order '$order' for '$CollectionName', defaulting to ascending."
             $finalOrder = $SortedPlexIds
         }
     }
@@ -1073,7 +1489,6 @@ function Set-PlexCollectionOrder {
     # 1) Find collection (via Maintainerr proxy)
     $collectionsUrl = "$MAINTAINERR_URL/api/plex/library/$LibrarySectionId/collections"
     try {
-        Log-Message -Type "DBG" -Message "GET $collectionsUrl"
         $collectionsResponse = Invoke-RestMethod -Uri $collectionsUrl -ErrorAction Stop
         $foundCollection = $collectionsResponse | Where-Object { $_.title -ieq $CollectionName }
         if (-not $foundCollection) {
@@ -1091,7 +1506,6 @@ function Set-PlexCollectionOrder {
     $setCustomSortUrl = "$PLEX_URL/library/metadata/$collectionId/prefs"
     $body = "collectionSort=2"
     try {
-        Log-Message -Type "DBG" -Message "PUT $setCustomSortUrl (token in header, x-www-form-urlencoded)"
         Invoke-RestMethod -Uri $setCustomSortUrl `
             -Method PUT `
             -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } `
@@ -1110,7 +1524,6 @@ function Set-PlexCollectionOrder {
         $afterId = $finalOrder[$i - 1]
         $moveUrl = "$PLEX_URL/library/collections/$collectionId/items/$itemId/move?after=$afterId"
         try {
-            Log-Message -Type "DBG" -Message "PUT $moveUrl (token in header)"
             Invoke-RestMethod -Uri $moveUrl `
                 -Method PUT `
                 -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } `
