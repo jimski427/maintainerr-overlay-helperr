@@ -26,18 +26,8 @@ RUN mkdir -p /fonts /images /images/originals /images/temp
 COPY maintainerr_days_left.ps1 /maintainerr_days_left.ps1
 COPY AvenirNextLTPro-Bold.ttf /fonts/AvenirNextLTPro-Bold.ttf
 
-# Copy any additional fonts from fonts directory if they exist
-COPY fonts/ /fonts/ 2>/dev/null || :
-
-# Copy docker entrypoint if you have one
-COPY docker-entrypoint.sh /docker-entrypoint.sh 2>/dev/null || echo '#!/bin/bash\nexec "$@"' > /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
-
 # Set the working directory
 WORKDIR /
-
-# Use entrypoint for better container control
-ENTRYPOINT ["/docker-entrypoint.sh"]
 
 # Run the PowerShell script
 CMD ["pwsh", "/maintainerr_days_left.ps1"]
