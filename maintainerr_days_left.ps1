@@ -1173,7 +1173,31 @@ function Process-MediaItems {
             $plexCollectionIds = Get-PlexCollectionItemIds -MAINTAINERR_URL $MAINTAINERR_URL `
                 -PLEX_URL $PLEX_URL -PLEX_TOKEN $PLEX_TOKEN `
                 -LibrarySectionId $LibrarySectionId -CollectionName $CollectionName
-
+            # ========================================================================
+            # NEW: Check if the Plex collection is empty and skip if it is
+            # ========================================================================
+            if (-not $plexCollectionIds -or $plexCollectionIds.Count -eq 0) {
+                Log-Message -Type "INF" -Message "Skipping empty collection: '$CollectionName' (no items found in Plex collection)."
+                
+                # Still need to handle state for any items that Maintainerr reports
+                # even though the Plex collection is empty (edge case)
+                if ($mediaList -and $mediaList.Count -gt 0) {
+                    Log-Message -Type "WRN" -Message "Note: Maintainerr reports $($mediaList.Count) items for '$CollectionName', but Plex collection is empty. Carrying state forward."
+                    foreach ($media in $mediaList) {
+                        $plexId = $media.PlexId
+                        $prior = $currentState["$plexId"]
+                        if ($null -ne $prior) {
+                            $newState["$plexId"] = $prior
+                        } else {
+                            $newState["$plexId"] = @{ processed = $false; deleteDate = $null }
+                        }
+                    }
+                }
+                continue
+            }
+            # ========================================================================
+            # END NEW
+            # ========================================================================
             foreach ($id in $plexCollectionIds) { [void]$script:AllPlexCollectionIds.Add("$id") }
 
             # If Maintainerr reports nothing, carry state forward using actual Plex collection items
