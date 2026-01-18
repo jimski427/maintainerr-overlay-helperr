@@ -797,37 +797,42 @@ function Get-PlexCollectionItemIds {
         [Parameter(Mandatory=$true)][string]$CollectionName
     )
 
-    # Find the collection ratingKey via Maintainerr proxy
-    $collectionsUrl = "$MAINTAINERR_URL/api/plex/library/$LibrarySectionId/collections"
-    $collectionsResponse = Invoke-RestMethod -Uri $collectionsUrl -ErrorAction Stop
-    $found = $collectionsResponse | Where-Object { $_.title -ieq $CollectionName }
-    if (-not $found) {
-        Log-Message -Type "WRN" -Message "Plex collection '$CollectionName' not found in section $LibrarySectionId."
+    try {
+        # Find the collection ratingKey via Maintainerr proxy
+        $collectionsUrl = "$MAINTAINERR_URL/api/plex/library/$LibrarySectionId/collections"
+        $collectionsResponse = Invoke-RestMethod -Uri $collectionsUrl -ErrorAction Stop
+        $found = $collectionsResponse | Where-Object { $_.title -ieq $CollectionName }
+        if (-not $found) {
+            Log-Message -Type "WRN" -Message "Plex collection '$CollectionName' not found in section $LibrarySectionId."
+            return @()
+        }
+
+        $collectionId = $found.ratingKey
+
+        # Fetch items in the collection directly from Plex
+        $itemsUrl = "$PLEX_URL/library/metadata/$collectionId/children"
+        $resp = Invoke-RestMethod -Uri $itemsUrl -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } -Method GET -ErrorAction Stop
+
+        $mc = $resp.MediaContainer
+        if (-not $mc) { return @() }
+
+        # Items can be Video/Directory depending on lib type - normalize to an array
+        $nodes = @()
+        foreach ($name in @('Video','Directory','Photo','Metadata')) {
+            if ($mc.$name) { $nodes += $mc.$name }
+        }
+        if (-not $nodes) { return @() }
+
+        $ids = @()
+        foreach ($n in $nodes) {
+            # ratingKey is the metadata id = PlexId
+            if ($n.ratingKey) { $ids += "$($n.ratingKey)" }
+        }
+        return @($ids | Select-Object -Unique)
+    } catch {
+        Log-Message -Type "ERR" -Message "Failed to get collection items for '$CollectionName': $_"
         return @()
     }
-
-    $collectionId = $found.ratingKey
-
-    # Fetch items in the collection directly from Plex
-    $itemsUrl = "$PLEX_URL/library/metadata/$collectionId/children"
-    $resp = Invoke-RestMethod -Uri $itemsUrl -Headers @{ "X-Plex-Token" = $PLEX_TOKEN } -Method GET -ErrorAction Stop
-
-    $mc = $resp.MediaContainer
-    if (-not $mc) { return @() }
-
-    # Items can be Video/Directory depending on lib type - normalize to an array
-    $nodes = @()
-    foreach ($name in @('Video','Directory','Photo','Metadata')) {
-        if ($mc.$name) { $nodes += $mc.$name }
-    }
-    if (-not $nodes) { return @() }
-
-    $ids = @()
-    foreach ($n in $nodes) {
-        # ratingKey is the metadata id = PlexId
-        if ($n.ratingKey) { $ids += "$($n.ratingKey)" }
-    }
-    return @($ids | Select-Object -Unique)
 }
 
 function Validate-Poster {
